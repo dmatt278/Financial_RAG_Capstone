@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data files - do not upload large datasets
+data/
+*.json
+*.jsonl
+*.csv
+*.parquet
+
+# Hugging Face / cache folders
+.cache/
+huggingface/
+
+# React / Node
+frontend/node_modules/
+frontend/dist/
+
+# Docker / database storage
+postgres_data/
+
+# OS files
+.DS_Store
+Thumbs.db
