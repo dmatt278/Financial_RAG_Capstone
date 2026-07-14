@@ -4,3 +4,9 @@ python-dotenv
 psycopg2-binary
 ijson
 huggingface_hub
+llama-index
+tiktoken
+chromadb
+sentence-transformers
+openai
+rank-bm25

@@ -27,6 +27,8 @@ frontend/dist/
 
 # Docker / database storage
 postgres_data/
+chroma/
+data/chroma/
 
 # OS files
 .DS_Store
