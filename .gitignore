@@ -10,6 +10,11 @@ __pycache__/
 venv/
 env/
 
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
 # Data files - do not upload large datasets
 data/
 *.json

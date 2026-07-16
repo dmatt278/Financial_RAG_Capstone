@@ -6,8 +6,13 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/app:/app/app
+      - chroma_data:/app/data/chroma
+      - huggingface_cache:/root/.cache/huggingface
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/financial_rag
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4}
+      - CHROMA_PERSIST_DIR=/app/data/chroma
     depends_on:
       - db
     
@@ -19,10 +24,10 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: financial_rag
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
 volumes:
   postgres_data:
+  chroma_data:
+  huggingface_cache:
