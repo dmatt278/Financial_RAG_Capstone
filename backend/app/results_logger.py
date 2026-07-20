@@ -2,7 +2,6 @@
 import json
 import os
 from typing import Any
-
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
 
@@ -38,7 +37,6 @@ def create_results_table():
         retrieval_method TEXT,
         chunk_strategy TEXT,
         chunk_size INTEGER,
-        chunk_overlap INTEGER,
         top_k INTEGER,
         reranker_used BOOLEAN,
         retrieved_chunk_ids JSONB,
@@ -80,7 +78,6 @@ def log_question_result(result: dict[str, Any]) -> int:
         retrieval_method,
         chunk_strategy,
         chunk_size,
-        chunk_overlap,
         top_k,
         reranker_used,
         retrieved_chunk_ids,
@@ -100,7 +97,6 @@ def log_question_result(result: dict[str, Any]) -> int:
         %(retrieval_method)s,
         %(chunk_strategy)s,
         %(chunk_size)s,
-        %(chunk_overlap)s,
         %(top_k)s,
         %(reranker_used)s,
         %(retrieved_chunk_ids)s,
@@ -123,7 +119,6 @@ def log_question_result(result: dict[str, Any]) -> int:
         "retrieval_method": result.get("retrieval_method"),
         "chunk_strategy": result.get("chunk_strategy"),
         "chunk_size": result.get("chunk_size"),
-        "chunk_overlap": result.get("chunk_overlap"),
         "top_k": result.get("top_k"),
         "reranker_used": result.get("reranker_used"),
         "retrieved_chunk_ids": Json(result.get("retrieved_chunk_ids", [])),
@@ -234,7 +229,6 @@ def get_parameter_summary(experiment_name: str, split: str | None = None):
         retrieval_method,
         chunk_strategy,
         chunk_size,
-        chunk_overlap,
         top_k,
         reranker_used,
         COUNT(*) AS questions_run,
@@ -254,7 +248,6 @@ def get_parameter_summary(experiment_name: str, split: str | None = None):
         retrieval_method,
         chunk_strategy,
         chunk_size,
-        chunk_overlap,
         top_k,
         reranker_used
     ORDER BY

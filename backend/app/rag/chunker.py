@@ -58,7 +58,7 @@ def count_tokens(s):
     return len(_CONFIG.tokenizer(s))
 
 
-def make_chunk(chunk_id, text, strategy, chunk_size, chunk_overlap=0,
+def make_chunk(chunk_id, text, strategy, chunk_size,
                part=None, item=None, header=None, is_table=False,
                start=None, end=None):
     """
@@ -71,7 +71,6 @@ def make_chunk(chunk_id, text, strategy, chunk_size, chunk_overlap=0,
         "tokens": count_tokens(text),
         "strategy": strategy,
         "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
         "part": part or "",
         "item": item or "",
         "header": header or "",
@@ -81,31 +80,31 @@ def make_chunk(chunk_id, text, strategy, chunk_size, chunk_overlap=0,
     }
 
 
-def _sentence_splitter(size, overlap):
+def _sentence_splitter(size):
     """
     Creates the sentence splitter shared by sentence and section chunking.
     """
 
-    return SentenceSplitter(chunk_size=size, chunk_overlap=overlap, tokenizer=_CONFIG.tokenizer)
+    return SentenceSplitter(chunk_size=size, chunk_overlap=0, tokenizer=_CONFIG.tokenizer)
 
 
-def fixed_size_chunks(text, size=256, overlap=0):
+def fixed_size_chunks(text, size=256):
     """
     Splits text into fixed token windows without respecting sentence boundaries.
     """
 
-    splitter = TokenTextSplitter(chunk_size=size, chunk_overlap=overlap, tokenizer=_CONFIG.tokenizer)
-    return [make_chunk(i, c, "fixed", size, overlap)
+    splitter = TokenTextSplitter(chunk_size=size, chunk_overlap=0, tokenizer=_CONFIG.tokenizer)
+    return [make_chunk(i, c, "fixed", size)
             for i, c in enumerate(splitter.split_text(text))]
 
 
-def sentence_aware_chunks(text, size=256, overlap=0):
+def sentence_aware_chunks(text, size=256):
     """
     Splits text into chunks that try to preserve sentence boundaries.
     """
 
-    splitter = _sentence_splitter(size, overlap)
-    return [make_chunk(i, c, "sentence", size, overlap)
+    splitter = _sentence_splitter(size)
+    return [make_chunk(i, c, "sentence", size)
             for i, c in enumerate(splitter.split_text(text))]
 
 
@@ -150,7 +149,7 @@ def classify(title):
     return 'sub', title
 
 
-def section_aware_chunks(text, size=256, overlap=0):
+def section_aware_chunks(text, size=256):
     """
     Splits text within Markdown sections while preserving section metadata.
 
@@ -163,12 +162,12 @@ def section_aware_chunks(text, size=256, overlap=0):
     has_headers = any(kind == "header" for kind, content, start in segs)
 
     if not has_headers:
-        chunks = sentence_aware_chunks(text, size=size, overlap=overlap)
+        chunks = sentence_aware_chunks(text, size=size)
         for c in chunks:
             c["strategy"] = "section_fallback_sentence"
         return chunks
     
-    splitter = _sentence_splitter(size, overlap)
+    splitter = _sentence_splitter(size)
     raw = []
     part = item = header = None
     for kind, content, start in segment(text):
@@ -191,23 +190,23 @@ def section_aware_chunks(text, size=256, overlap=0):
             for piece in splitter.split_text(content):
                 raw.append((prefix + piece, part, item, header, False, start))
 
-    return [make_chunk(i, t, "section", size, overlap, p, it, h, tbl, st)
+    return [make_chunk(i, t, "section", size, p, it, h, tbl, st)
             for i, (t, p, it, h, tbl, st) in enumerate(raw)]
 
 
-def chunk_document(text, strategy="section", size=512, overlap=0):
+def chunk_document(text, strategy="section", size=512):
     """
     Dispatches a document to the selected chunking strategy.
     """
 
     if strategy == "fixed":
-        return fixed_size_chunks(text, size=size, overlap=overlap)
+        return fixed_size_chunks(text, size=size)
 
     if strategy == "sentence":
-        return sentence_aware_chunks(text, size=size, overlap=overlap)
+        return sentence_aware_chunks(text, size=size)
 
     if strategy == "section":
-        return section_aware_chunks(text, size=size, overlap=overlap)
+        return section_aware_chunks(text, size=size)
 
     raise ValueError(f"Unknown chunking strategy: {strategy}")
 

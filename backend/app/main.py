@@ -1,11 +1,12 @@
 from fastapi import FastAPI
+from app.data.data_loader import BASELINE_SPLIT, TUNING_SPLIT
 from app.rag.pipeline import (
     full_rag,
     full_rag_with_math_agent,
     get_baseline_results,
     top_chunks,
 )
-from app.rag.vector_store import insert_docfinqa_chunk_sweep, insert_docfinqa_examples
+from app.rag.vector_store import insert_docfinqa_chunk_sweep
 from app.results_logger import get_final_result_tables
 
 app = FastAPI(title='Financial RAG Capstone API')
@@ -34,69 +35,59 @@ def health_check():
 
 @app.post("/load-docfinqa")
 def load_docfinqa(
-    split: str = "train",
     start_index: int = 0,
-    limit: int = 10,
-    strategy: str = "section",
-    chunk_size: int = 512,
-    overlap: int = 50,
-    full_sweep: bool = True,
+    limit: int | None = None,
     reset: bool = False,
 ):
     """
-    Loads a range of DocFinQA examples into Chroma for vector retrieval.
+    Loads and chunks all DocFinQA splits into Chroma for vector retrieval.
     """
 
-    if full_sweep:
-        return insert_docfinqa_chunk_sweep(
-            split=split,
-            start_index=start_index,
-            limit=limit,
-            overlap=overlap,
-            reset=reset,
-        )
-
-    return insert_docfinqa_examples(
-        split=split,
+    train_dev_result = insert_docfinqa_chunk_sweep(
+        split=TUNING_SPLIT,
         start_index=start_index,
         limit=limit,
-        strategy=strategy,
-        chunk_size=chunk_size,
-        overlap=overlap,
         reset=reset,
     )
+
+    test_result = insert_docfinqa_chunk_sweep(
+        split=BASELINE_SPLIT,
+        start_index=start_index,
+        limit=limit,
+        reset=False,
+    )
+
+    return {
+        TUNING_SPLIT: train_dev_result,
+        BASELINE_SPLIT: test_result,
+    }
 
 
 @app.get("/run-chunk-rag")
 def chunk_rag(
-    split: str = "train",
     start_index: int = 0,
     limit: int = 15,
     chunk_size: int = 512,
-    overlap: int = 50,
     log_results: bool = True,
 ):
     '''
     Full parameter sweep for only chunk retrieval. Metrics will be based on the chunks retrieved.
     '''
     return top_chunks(
-        split=split,
+        split=TUNING_SPLIT,
         start_index=start_index,
         limit=limit,
         chunk_size=chunk_size,
-        overlap=overlap,
         log_results=log_results,
     )
 
 
 @app.get("/run-full-rag")
 def full_rag_pipeline(
-    split: str = "train",
     index: int = 0,
     top_k: int = 3,
     strategy: str = "fixed",
     chunk_size: int = 512,
-    overlap: int = 50,
     retrieval_method: str = "semantic",
     log_result: bool = True,
 ):
@@ -105,12 +96,11 @@ def full_rag_pipeline(
     Metrics produced will be based on the generation.
     '''
     return full_rag(
-        split=split,
+        split=TUNING_SPLIT,
         index=index,
         top_k=top_k,
         strategy=strategy,
         chunk_size=chunk_size,
-        overlap=overlap,
         retrieval_method=retrieval_method,
         log_result=log_result,
     )
@@ -118,22 +108,19 @@ def full_rag_pipeline(
 
 @app.get("/run-full-rag-math-agent")
 def full_rag_math_agent_pipeline(
-    split: str = "train",
     start_index: int = 0,
     limit: int = 15,
     chunk_size: int = 512,
-    overlap: int = 50,
     log_results: bool = True,
 ):
     '''
     Full parameter sweep on the RAG pipeline using the DocFinQA math agent.
     '''
     return full_rag_with_math_agent(
-        split=split,
+        split=TUNING_SPLIT,
         start_index=start_index,
         limit=limit,
         chunk_size=chunk_size,
-        overlap=overlap,
         log_results=log_results,
     )
     

@@ -1,5 +1,5 @@
 from typing import Any
-from app.data.data_loader import iter_docfinqa_examples
+from app.data.data_loader import BASELINE_SPLIT, TUNING_SPLIT, iter_docfinqa_examples
 from app.evaluation import evaluate_docfinqa_answer, evaluate_retrieval
 from app.rag.generator import generate_answer
 from app.rag.math_agent import math_agent
@@ -8,12 +8,11 @@ from app.rag.retriever import get_collection
 from app.results_logger import log_question_result
 
 def full_rag(
-    split: str = "train",
+    split: str = TUNING_SPLIT,
     index: int = 0,
     top_k: int = 3,
     strategy: str = "fixed",
     chunk_size: int = 512,
-    overlap: int = 50,
     retrieval_method: str = "semantic",
     log_result: bool = True,
 ) -> dict[str, Any]:
@@ -36,7 +35,6 @@ def full_rag(
             {"source_index": {"$eq": index}},
             {"strategy": {"$eq": strategy}},
             {"chunk_size": {"$eq": chunk_size}},
-            {"chunk_overlap": {"$eq": overlap}},
         ]
     }
 
@@ -72,7 +70,6 @@ def full_rag(
         "retrieval_method": retrieval_method,
         "chunk_strategy": strategy,
         "chunk_size": chunk_size,
-        "chunk_overlap": overlap,
         "top_k": top_k,
         "reranker_used": False,
         "retrieved_chunk_ids": [chunk["id"] for chunk in retrieved_chunks],
@@ -99,14 +96,13 @@ def full_rag(
 
 
 def top_chunks(
-    split: str = "train",
+    split: str = TUNING_SPLIT,
     start_index: int = 0,
     limit: int = 15,
     top_k_values: list[int] | None = None,
     strategies: list[str] | None = None,
     retrieval_methods: list[str] | None = None,
     chunk_size: int = 512,
-    overlap: int = 50,
     log_results: bool = True,
 ):
     """
@@ -132,7 +128,6 @@ def top_chunks(
                             {"source_index": {"$eq": source_index}},
                             {"strategy": {"$eq": strategy}},
                             {"chunk_size": {"$eq": chunk_size}},
-                            {"chunk_overlap": {"$eq": overlap}},
                         ]
                     }
 
@@ -160,7 +155,6 @@ def top_chunks(
                         "retrieval_method": retrieval_method,
                         "chunk_strategy": strategy,
                         "chunk_size": chunk_size,
-                        "chunk_overlap": overlap,
                         "top_k": top_k,
                         "reranker_used": False,
                         "retrieved_chunk_ids": [chunk["id"] for chunk in chunks],
@@ -178,14 +172,13 @@ def top_chunks(
 
 
 def full_rag_with_math_agent(
-    split: str = "train",
+    split: str = TUNING_SPLIT,
     start_index: int = 0,
     limit: int = 15,
     top_k_values: list[int] | None = None,
     strategies: list[str] | None = None,
     retrieval_methods: list[str] | None = None,
     chunk_size: int = 512,
-    overlap: int = 50,
     log_results: bool = True,
 ):
     """
@@ -211,7 +204,6 @@ def full_rag_with_math_agent(
                             {"source_index": {"$eq": source_index}},
                             {"strategy": {"$eq": strategy}},
                             {"chunk_size": {"$eq": chunk_size}},
-                            {"chunk_overlap": {"$eq": overlap}},
                         ]
                     }
 
@@ -249,7 +241,6 @@ def full_rag_with_math_agent(
                         "retrieval_method": retrieval_method,
                         "chunk_strategy": strategy,
                         "chunk_size": chunk_size,
-                        "chunk_overlap": overlap,
                         "top_k": top_k,
                         "reranker_used": False,
                         "retrieved_chunk_ids": [chunk["id"] for chunk in chunks],
@@ -296,11 +287,10 @@ def get_baseline_results():
         source_index = chunk.get("metadata", {}).get("source_index")
         where = {
             "$and": [
-                {"split": {"$eq": "train"}},
+                {"split": {"$eq": BASELINE_SPLIT}},
                 {"source_index": {"$eq": source_index}},
                 {"strategy": {"$eq": "fixed"}},
                 {"chunk_size": {"$eq": 512}},
-                {"chunk_overlap": {"$eq": 50}},
             ]
         }
 

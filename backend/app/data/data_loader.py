@@ -1,12 +1,71 @@
+import json
+import os
+from pathlib import Path
+import tempfile
 import ijson
 from huggingface_hub import hf_hub_download
 from typing import Iterator
 
 
-def get_docfinqa_file_path(split: str = "train") -> str:
+TUNING_SPLIT = "train_dev"
+BASELINE_SPLIT = "test"
+
+
+def get_docfinqa_data_dir() -> Path:
+    """Returns the directory used for the combined train/dev file."""
+
+    configured_dir = os.getenv("DOCFINQA_DATA_DIR")
+    if configured_dir:
+        return Path(configured_dir)
+    return Path(__file__).resolve().parents[3] / "data" / "docfinqa"
+
+
+def prepare_train_dev_file(force: bool = False) -> str:
+    """Combines DocFinQA train and dev into one streamed JSON file."""
+
+    destination = get_docfinqa_data_dir() / "train_dev.json"
+    if destination.is_file() and not force:
+        return str(destination)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=".train_dev.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temp_path = Path(temp_name)
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write("[")
+            first_record = True
+
+            for source_split in ("train", "dev"):
+                source_path = get_docfinqa_file_path(source_split)
+                with open(source_path, "rb") as source_file:
+                    for raw_example in ijson.items(source_file, "item"):
+                        if not first_record:
+                            output.write(",")
+                        first_record = False
+                        json.dump(raw_example, output, ensure_ascii=False)
+
+            output.write("]")
+
+        os.replace(temp_path, destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    return str(destination)
+
+
+def get_docfinqa_file_path(split: str = TUNING_SPLIT) -> str:
     '''
     Downloads or locates the raw DocFinQA JSON file from Hugging Face.
     '''
+
+    if split == TUNING_SPLIT:
+        return prepare_train_dev_file()
 
     filename_map = {
         "train": "train.json",
@@ -15,7 +74,9 @@ def get_docfinqa_file_path(split: str = "train") -> str:
     }
 
     if split not in filename_map:
-        raise ValueError(f"Invalid split: {split}. Use 'train', 'dev', or 'test'.")
+        raise ValueError(
+            f"Invalid split: {split}. Use 'train', 'dev', 'train_dev', or 'test'."
+        )
     
     file_path = hf_hub_download(
         repo_id="kensho/DocFinQA",
@@ -40,7 +101,7 @@ def convert_docfinqa_fields(raw_example: dict, question_id: int) -> dict:
     }
 
 
-def load_docfinqa_example(split: str = "train", index: int = 0) -> dict:
+def load_docfinqa_example(split: str = TUNING_SPLIT, index: int = 0) -> dict:
     """
     Loads one DocFinQA example by index without loading the entire dataset into memory.
     """
@@ -58,7 +119,7 @@ def load_docfinqa_example(split: str = "train", index: int = 0) -> dict:
 
 
 def load_docfinqa_example_by_question_id(
-    split: str = "train",
+    split: str = TUNING_SPLIT,
     question_id: str = "1234",
 ) -> dict:
     """
@@ -75,7 +136,7 @@ def load_docfinqa_example_by_question_id(
 
 
 def iter_docfinqa_examples(
-    split: str = "train",
+    split: str = TUNING_SPLIT,
     start_index: int = 0,
     limit: int | None = None,
 ) -> Iterator[dict]:

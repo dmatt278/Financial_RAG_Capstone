@@ -20,6 +20,10 @@
 
 ## Week 2 Chroma indexing
 
+DocFinQA parameter tuning uses the combined `train_dev` split. Baseline
+comparisons use only the held-out `test` split. The combined file is created
+automatically the first time `train_dev` is loaded.
+
 Install backend dependencies:
 
 ```bash
@@ -32,16 +36,17 @@ Start the API from the `backend` folder:
 uvicorn app.main:app --reload
 ```
 
-Build a small persisted Chroma index:
+Build the persisted Chroma index. This one call chunks the combined train/dev
+data and the test data using all nine chunking configurations:
 
 ```bash
-curl -X POST "http://localhost:8000/index-docfinqa?split=train&start_index=0&limit=10&strategy=section&chunk_size=512&overlap=50&reset=true"
+curl -X POST "http://localhost:8000/load-docfinqa?start_index=0&reset=true"
 ```
 
 Query the indexed chunks for a sample DocFinQA question:
 
 ```bash
-curl "http://localhost:8000/retrieve-chroma-sample?split=train&index=0&top_k=3"
+curl "http://localhost:8000/retrieve-chroma-sample?split=train_dev&index=0&top_k=3"
 ```
 
 Generate an answer with the Week 2-3 RAG pipeline:
@@ -60,14 +65,14 @@ Run semantic retrieval on a small DocFinQA sample and save the result file:
 
 ```bash
 cd backend
-python -m app.evaluation.retrieval_eval --index-first --reset --split train --start-index 0 --limit 10 --top-k 3 --output ../data/processed/retrieval_sample_results.json
+python -m app.evaluation.retrieval_eval --index-first --reset --split train_dev --start-index 0 --limit 10 --top-k 3 --output ../data/processed/retrieval_sample_results.json
 ```
 
 CSV output works too:
 
 ```bash
 cd backend
-python -m app.evaluation.retrieval_eval --split train --start-index 0 --limit 10 --top-k 3 --output ../data/processed/retrieval_sample_results.csv
+python -m app.evaluation.retrieval_eval --split train_dev --start-index 0 --limit 10 --top-k 3 --output ../data/processed/retrieval_sample_results.csv
 ```
 
 The output includes `question`, `gold_answer`, `retrieved_chunk_ids`, and

@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from app.data.data_loader import iter_docfinqa_examples
+from app.data.data_loader import TUNING_SPLIT, iter_docfinqa_examples
 from app.rag.chunker import chunk_document
 from app.rag.embedder import embed_texts
 
@@ -117,7 +117,6 @@ def _chunk_metadata(
         "tokens": chunk.get("tokens", 0),
         "strategy": chunk.get("strategy", ""),
         "chunk_size": chunk.get("chunk_size", 0),
-        "chunk_overlap": chunk.get("chunk_overlap", 0),
         "part": chunk.get("part", ""),
         "item": chunk.get("item", ""),
         "header": chunk.get("header", ""),
@@ -158,12 +157,11 @@ def _upsert_chunks_in_batches(
 
 
 def insert_docfinqa_examples(
-    split: str = "train",
+    split: str = TUNING_SPLIT,
     start_index: int = 0,
-    limit: int = 10,
+    limit: int | None = None,
     strategy: str = "section",
     chunk_size: int = 512,
-    overlap: int = 50,
     collection_name: str = DEFAULT_COLLECTION_NAME,
     reset: bool = False,
 ) -> dict[str, Any]:
@@ -187,13 +185,12 @@ def insert_docfinqa_examples(
             example["document_text"],
             strategy=strategy,
             size=chunk_size,
-            overlap=overlap,
         )
 
         for chunk in chunks:
             chunk_id = chunk["chunk_id"]
             ids.append(
-                f"{split}-{example['question_id']}-{strategy}-{chunk_size}-{overlap}-{chunk_id}"
+                f"{split}-{example['question_id']}-{strategy}-{chunk_size}-{chunk_id}"
             )
             documents.append(chunk["text"])
             metadatas.append(_chunk_metadata(example, split, source_index, chunk))
@@ -216,7 +213,6 @@ def insert_docfinqa_examples(
         "limit": limit,
         "strategy": strategy,
         "chunk_size": chunk_size,
-        "overlap": overlap,
         "inserted_examples": inserted_examples,
         "inserted_chunks": inserted_chunks,
         "collection_count": collection.count(),
@@ -224,12 +220,11 @@ def insert_docfinqa_examples(
 
 
 def insert_docfinqa_chunk_sweep(
-    split: str = "train",
+    split: str = TUNING_SPLIT,
     start_index: int = 0,
-    limit: int = 10,
+    limit: int | None = None,
     strategies: list[str] | None = None,
     chunk_sizes: list[int] | None = None,
-    overlap: int = 50,
     collection_name: str = DEFAULT_COLLECTION_NAME,
     reset: bool = False,
 ) -> dict[str, Any]:
@@ -245,6 +240,7 @@ def insert_docfinqa_chunk_sweep(
     documents: list[str] = []
     metadatas: list[dict[str, Any]] = []
     inserted_examples = 0
+    inserted_chunks = 0
     config_results = []
 
     for source_index, example in enumerate(
@@ -259,7 +255,6 @@ def insert_docfinqa_chunk_sweep(
                     example["document_text"],
                     strategy=strategy,
                     size=chunk_size,
-                    overlap=overlap,
                 )
 
                 config_results.append(
@@ -275,15 +270,24 @@ def insert_docfinqa_chunk_sweep(
                 for chunk in chunks:
                     chunk_id = chunk["chunk_id"]
                     ids.append(
-                        f"{split}-{example['question_id']}-{strategy}-{chunk_size}-{overlap}-{chunk_id}"
+                        f"{split}-{example['question_id']}-{strategy}-{chunk_size}-{chunk_id}"
                     )
                     documents.append(chunk["text"])
                     metadatas.append(_chunk_metadata(example, split, source_index, chunk))
 
-    inserted_chunks = 0
+                    if len(documents) >= DEFAULT_UPSERT_BATCH_SIZE:
+                        inserted_chunks += _upsert_chunks_in_batches(
+                            collection=collection,
+                            ids=ids,
+                            documents=documents,
+                            metadatas=metadatas,
+                        )
+                        ids.clear()
+                        documents.clear()
+                        metadatas.clear()
 
     if documents:
-        inserted_chunks = _upsert_chunks_in_batches(
+        inserted_chunks += _upsert_chunks_in_batches(
             collection=collection,
             ids=ids,
             documents=documents,
@@ -298,7 +302,6 @@ def insert_docfinqa_chunk_sweep(
         "limit": limit,
         "strategies": strategies,
         "chunk_sizes": chunk_sizes,
-        "overlap": overlap,
         "inserted_examples": inserted_examples,
         "inserted_configs_per_example": len(strategies) * len(chunk_sizes),
         "inserted_chunks": inserted_chunks,
