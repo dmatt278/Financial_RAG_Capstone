@@ -51,20 +51,30 @@ def get_top_k_chunks(
     top_k: int = 3,
     collection_name: str = DEFAULT_COLLECTION_NAME,
     where: dict[str, Any] | None = None,
-    retrieval_method: Literal["keyword", "semantic", "hybrid"] = "keyword"
+    retrieval_method: Literal["keyword", "semantic", "hybrid"] = "keyword",
+    reranker_enabled: bool = False,
+    reranker_pool_size: int = 20,
 ) -> List[Dict]:
     """
     Embeds a question and retrieves the top-k most similar chunks from Chroma.
     """
 
     collection = get_collection(collection_name)
+    retrieval_count = (
+        max(top_k, reranker_pool_size) if reranker_enabled else top_k
+    )
+
     if retrieval_method == "keyword":
-        return keyword_search(collection, question, top_k, where)
+        chunks = keyword_search(collection, question, retrieval_count, where)
+    elif retrieval_method == "semantic":
+        chunks = semantic_search(collection, question, retrieval_count, where)
+    else:
+        chunks = hybrid_search(collection, question, retrieval_count, where)
 
-    if retrieval_method == "semantic":
-        return semantic_search(collection, question, top_k, where)
-
-    return hybrid_search(collection, question, top_k, where)
+    chunks = chunks[:retrieval_count]
+    if reranker_enabled:
+        return cross_encoder_reranker(chunks, question, top_k)
+    return chunks[:top_k]
  
  
 def tokenize(text: str) -> list[str]:
@@ -153,9 +163,15 @@ def hybrid_search(collection, question, top_k, where):
 
 
 def cross_encoder_reranker(chunks, question, top_k):
+    if not chunks:
+        return []
+
     model = get_reranker()
     combined = [(question, chunk["text"]) for chunk in chunks]
     scores = model.predict(combined)
+
+    for chunk, score in zip(chunks, scores):
+        chunk["rerank_score"] = float(score)
 
     #need to sort by score
     reranked = sorted(

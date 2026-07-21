@@ -1,11 +1,26 @@
+import os
 from typing import Any
 from app.data.data_loader import BASELINE_SPLIT, TUNING_SPLIT, iter_docfinqa_examples
 from app.evaluation import evaluate_docfinqa_answer, evaluate_retrieval
 from app.rag.generator import generate_answer
 from app.rag.math_agent import math_agent
 from app.rag.retriever import get_top_k_chunks
-from app.rag.retriever import get_collection
 from app.results_logger import log_question_result
+
+
+OPTIMIZED_RAG_CONFIG = {
+    "retrieval_method": os.getenv("OPTIMIZED_RETRIEVAL_METHOD", "hybrid"),
+    "reranker_enabled": (
+        os.getenv("OPTIMIZED_RERANKER_ENABLED", "true").lower() == "true"
+    ),
+    "strategy": os.getenv("OPTIMIZED_CHUNK_STRATEGY", "section"),
+    "chunk_size": int(os.getenv("OPTIMIZED_CHUNK_SIZE", "512")),
+    "top_k": int(os.getenv("OPTIMIZED_TOP_K", "5")),
+    "reranker_pool_size": int(
+        os.getenv("OPTIMIZED_RERANKER_POOL_SIZE", "20")
+    ),
+}
+
 
 def full_rag(
     split: str = TUNING_SPLIT,
@@ -261,30 +276,72 @@ def full_rag_with_math_agent(
 
 
 def get_baseline_results():
-    chunks = get_collection()
-    
     #get metrics on each of these
     #no context just question
-    no_context = chunks
-    for chunk in no_context:
-        answer = generate_answer(chunk["question"], "")
-        chunk["score"] = evaluate_docfinqa_answer(answer, chunk["Answer"])
+    for example in iter_docfinqa_examples(split=BASELINE_SPLIT):
+        answer = generate_answer(example["question"], [])
+        is_correct = evaluate_docfinqa_answer(answer, example["gold_answer"])
 
-    log_question_result(no_context)
+        log_question_result({
+            "experiment_name": "baseline",
+            "dataset": "docfinqa",
+            "split": BASELINE_SPLIT,
+            "question_id": example["question_id"],
+            "question": example["question"],
+            "gold_answer": example["gold_answer"],
+            "generated_answer": answer,
+            "is_correct": is_correct,
+            "retrieval_method": None,
+            "chunk_strategy": None,
+            "chunk_size": None,
+            "top_k": None,
+            "reranker_used": False,
+            "retrieved_chunk_ids": [],
+            "retrieved_chunks": [],
+            "retrieval_metrics": {},
+            "generation_metrics": {
+                "baseline": "no_context",
+                "docfinqa_answer_correct": is_correct,
+            },
+        })
 
     #full document and question
-    full_doc = chunks
-    for chunk in full_doc:
-        answer = generate_answer(chunk["Question"], chunk["Context"])
-        chunk["score"] = evaluate_docfinqa_answer(answer, chunk["Answer"])
-    
-    log_question_result(full_doc)
+    for example in iter_docfinqa_examples(split=BASELINE_SPLIT):
+        full_document_context = [{
+            "chunk_id": "full_document",
+            "text": example["document_text"],
+            "metadata": {"question_id": example["question_id"]},
+        }]
+        answer = generate_answer(example["question"], full_document_context)
+        is_correct = evaluate_docfinqa_answer(answer, example["gold_answer"])
+
+        log_question_result({
+            "experiment_name": "baseline",
+            "dataset": "docfinqa",
+            "split": BASELINE_SPLIT,
+            "question_id": example["question_id"],
+            "question": example["question"],
+            "gold_answer": example["gold_answer"],
+            "generated_answer": answer,
+            "is_correct": is_correct,
+            "retrieval_method": None,
+            "chunk_strategy": None,
+            "chunk_size": None,
+            "top_k": None,
+            "reranker_used": False,
+            "retrieved_chunk_ids": [],
+            "retrieved_chunks": [],
+            "retrieval_metrics": {},
+            "generation_metrics": {
+                "baseline": "full_document",
+                "docfinqa_answer_correct": is_correct,
+            },
+        })
     
     #navie RAG
-    naive_rag = chunks
-    for chunk in naive_rag:
-        #get chunks with parameters
-        source_index = chunk.get("metadata", {}).get("source_index")
+    for source_index, example in enumerate(
+        iter_docfinqa_examples(split=BASELINE_SPLIT)
+    ):
         where = {
             "$and": [
                 {"split": {"$eq": BASELINE_SPLIT}},
@@ -295,28 +352,98 @@ def get_baseline_results():
         }
 
         best_chunks = get_top_k_chunks(
-            question=chunk["metadata"]["question"],
+            question=example["question"],
             top_k=3,
-            collection_name=chunks,
             where=where,
             retrieval_method="semantic"
         )
-        #generate answer from question and top chunks
-        answer = generate_answer(chunk["Question"], best_chunks)
-        #evaluate the generated answer
-        chunk["score"] = evaluate_docfinqa_answer(answer, chunk["Answer"])
-    
-    log_question_result(naive_rag)
+        retrieval_metrics = evaluate_retrieval(
+            chunks=best_chunks,
+            k=3,
+            program=example["program"],
+        )
+        answer = generate_answer(example["question"], best_chunks)
+        is_correct = evaluate_docfinqa_answer(answer, example["gold_answer"])
 
-    #TBD
+        log_question_result({
+            "experiment_name": "baseline",
+            "dataset": "docfinqa",
+            "split": BASELINE_SPLIT,
+            "question_id": example["question_id"],
+            "question": example["question"],
+            "gold_answer": example["gold_answer"],
+            "generated_answer": answer,
+            "is_correct": is_correct,
+            "retrieval_method": "semantic",
+            "chunk_strategy": "fixed",
+            "chunk_size": 512,
+            "top_k": 3,
+            "reranker_used": False,
+            "retrieved_chunk_ids": [chunk["id"] for chunk in best_chunks],
+            "retrieved_chunks": best_chunks,
+            "retrieval_metrics": retrieval_metrics,
+            "generation_metrics": {
+                "baseline": "naive_rag",
+                "docfinqa_answer_correct": is_correct,
+            },
+        })
+
     #optimized RAG
-    best_rag = chunks
-    for chunk in best_rag:
-        #get chunks with parameters
-        #generate answer from question and top chunks
-        #evaluate the generated answer
-        z = 0
+    config = OPTIMIZED_RAG_CONFIG
+    for source_index, example in enumerate(
+        iter_docfinqa_examples(split=BASELINE_SPLIT)
+    ):
+        where = {
+            "$and": [
+                {"split": {"$eq": BASELINE_SPLIT}},
+                {"source_index": {"$eq": source_index}},
+                {"strategy": {"$eq": config["strategy"]}},
+                {"chunk_size": {"$eq": config["chunk_size"]}},
+            ]
+        }
 
-    log_question_result(best_rag)
+        best_chunks = get_top_k_chunks(
+            question=example["question"],
+            top_k=config["top_k"],
+            where=where,
+            retrieval_method=config["retrieval_method"],
+            reranker_enabled=config["reranker_enabled"],
+            reranker_pool_size=config["reranker_pool_size"],
+        )
+        retrieval_metrics = evaluate_retrieval(
+            chunks=best_chunks,
+            k=config["top_k"],
+            program=example["program"],
+        )
+        retrieval_metrics["reranker_pool_size"] = (
+            config["reranker_pool_size"]
+            if config["reranker_enabled"]
+            else None
+        )
+        answer = generate_answer(example["question"], best_chunks)
+        is_correct = evaluate_docfinqa_answer(answer, example["gold_answer"])
+
+        log_question_result({
+            "experiment_name": "baseline",
+            "dataset": "docfinqa",
+            "split": BASELINE_SPLIT,
+            "question_id": example["question_id"],
+            "question": example["question"],
+            "gold_answer": example["gold_answer"],
+            "generated_answer": answer,
+            "is_correct": is_correct,
+            "retrieval_method": config["retrieval_method"],
+            "chunk_strategy": config["strategy"],
+            "chunk_size": config["chunk_size"],
+            "top_k": config["top_k"],
+            "reranker_used": config["reranker_enabled"],
+            "retrieved_chunk_ids": [chunk["id"] for chunk in best_chunks],
+            "retrieved_chunks": best_chunks,
+            "retrieval_metrics": retrieval_metrics,
+            "generation_metrics": {
+                "baseline": "optimized_rag",
+                "docfinqa_answer_correct": is_correct,
+            },
+        })
 
     return []
