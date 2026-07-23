@@ -7,6 +7,7 @@ huggingface_hub
 llama-index
 tiktoken
 chromadb
-sentence-transformers
+sentence-transformers>=2.7.0
+transformers>=4.51.0
 openai
 rank-bm25

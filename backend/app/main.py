@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.data.data_loader import BASELINE_SPLIT, TUNING_SPLIT
+from app.data.data_loader import TUNING_SPLIT
 from app.rag.pipeline import (
     full_rag,
     full_rag_with_math_agent,
@@ -40,27 +40,14 @@ def load_docfinqa(
     reset: bool = False,
 ):
     """
-    Loads and chunks all DocFinQA splits into Chroma for vector retrieval.
+    Loads and chunks all unique DocFinQA documents into Chroma for vector retrieval.
     """
 
-    train_dev_result = insert_docfinqa_chunk_sweep(
-        split=TUNING_SPLIT,
+    return insert_docfinqa_chunk_sweep(
         start_index=start_index,
         limit=limit,
         reset=reset,
     )
-
-    test_result = insert_docfinqa_chunk_sweep(
-        split=BASELINE_SPLIT,
-        start_index=start_index,
-        limit=limit,
-        reset=False,
-    )
-
-    return {
-        TUNING_SPLIT: train_dev_result,
-        BASELINE_SPLIT: test_result,
-    }
 
 
 @app.get("/run-chunk-rag")
@@ -92,8 +79,7 @@ def full_rag_pipeline(
     log_result: bool = True,
 ):
     '''
-    Runs the full RAG pipeline for one DocFinQA question. Answer will be generated as well.
-    Metrics produced will be based on the generation.
+    Runs the full RAG pipeline for one train/dev DocFinQA question.
     '''
     return full_rag(
         split=TUNING_SPLIT,

@@ -46,8 +46,7 @@ def full_rag(
 
     where = {
         "$and": [
-            {"split": {"$eq": split}},
-            {"source_index": {"$eq": index}},
+            {"document_id": {"$eq": example["document_id"]}},
             {"strategy": {"$eq": strategy}},
             {"chunk_size": {"$eq": chunk_size}},
         ]
@@ -130,17 +129,13 @@ def top_chunks(
 
     results = []
 
-    for source_index, example in enumerate(
-        iter_docfinqa_examples(split=split, start_index=start_index, limit=limit),
-        start=start_index,
-    ):
+    for example in iter_docfinqa_examples(split=split, start_index=start_index, limit=limit):
         for strategy in strategies:
             for retrieval_method in retrieval_methods:
                 for top_k in top_k_values:
                     where = {
                         "$and": [
-                            {"split": {"$eq": split}},
-                            {"source_index": {"$eq": source_index}},
+                            {"document_id": {"$eq": example["document_id"]}},
                             {"strategy": {"$eq": strategy}},
                             {"chunk_size": {"$eq": chunk_size}},
                         ]
@@ -206,17 +201,13 @@ def full_rag_with_math_agent(
 
     results = []
 
-    for source_index, example in enumerate(
-        iter_docfinqa_examples(split=split, start_index=start_index, limit=limit),
-        start=start_index,
-    ):
+    for example in iter_docfinqa_examples(split=split, start_index=start_index, limit=limit):
         for strategy in strategies:
             for retrieval_method in retrieval_methods:
                 for top_k in top_k_values:
                     where = {
                         "$and": [
-                            {"split": {"$eq": split}},
-                            {"source_index": {"$eq": source_index}},
+                            {"document_id": {"$eq": example["document_id"]}},
                             {"strategy": {"$eq": strategy}},
                             {"chunk_size": {"$eq": chunk_size}},
                         ]
@@ -339,13 +330,10 @@ def get_baseline_results():
         })
     
     #navie RAG
-    for source_index, example in enumerate(
-        iter_docfinqa_examples(split=BASELINE_SPLIT)
-    ):
+    for example in iter_docfinqa_examples(split=BASELINE_SPLIT):
         where = {
             "$and": [
-                {"split": {"$eq": BASELINE_SPLIT}},
-                {"source_index": {"$eq": source_index}},
+                {"document_id": {"$eq": example["document_id"]}},
                 {"strategy": {"$eq": "fixed"}},
                 {"chunk_size": {"$eq": 512}},
             ]
@@ -390,13 +378,10 @@ def get_baseline_results():
 
     #optimized RAG
     config = OPTIMIZED_RAG_CONFIG
-    for source_index, example in enumerate(
-        iter_docfinqa_examples(split=BASELINE_SPLIT)
-    ):
+    for example in iter_docfinqa_examples(split=BASELINE_SPLIT):
         where = {
             "$and": [
-                {"split": {"$eq": BASELINE_SPLIT}},
-                {"source_index": {"$eq": source_index}},
+                {"document_id": {"$eq": example["document_id"]}},
                 {"strategy": {"$eq": config["strategy"]}},
                 {"chunk_size": {"$eq": config["chunk_size"]}},
             ]

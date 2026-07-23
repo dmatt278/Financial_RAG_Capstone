@@ -1,7 +1,8 @@
 from functools import lru_cache
 
 
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_EMBEDDING_BATCH_SIZE = 8
 
 
 @lru_cache(maxsize=1)
@@ -16,16 +17,34 @@ def _get_sentence_transformer():
         return SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
     except Exception as exc:
         raise RuntimeError(
-            "Failed to load sentence-transformers/all-MiniLM-L6-v2. "
+            "Failed to load Qwen/Qwen3-Embedding-0.6B. "
             "Install backend requirements and make sure the model is available "
             "before indexing or querying Chroma."
         ) from exc
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_documents(texts: list[str]) -> list[list[float]]:
     """
-    Embeds text for Chroma using all-MiniLM-L6-v2.
+    Embeds document chunks for storage in Chroma.
     """
 
     model = _get_sentence_transformer()
-    return model.encode(texts, normalize_embeddings=True).tolist()
+    return model.encode(
+        texts,
+        batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
+        normalize_embeddings=True,
+    ).tolist()
+
+
+def embed_queries(texts: list[str]) -> list[list[float]]:
+    """
+    Embeds retrieval questions using Qwen's query instruction.
+    """
+
+    model = _get_sentence_transformer()
+    return model.encode(
+        texts,
+        prompt_name="query",
+        batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
+        normalize_embeddings=True,
+    ).tolist()

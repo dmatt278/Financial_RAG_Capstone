@@ -164,7 +164,7 @@ def section_aware_chunks(text, size=256):
     if not has_headers:
         chunks = sentence_aware_chunks(text, size=size)
         for c in chunks:
-            c["strategy"] = "section_fallback_sentence"
+            c["strategy"] = "section"
         return chunks
     
     splitter = _sentence_splitter(size)

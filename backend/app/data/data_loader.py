@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -97,6 +98,7 @@ def convert_docfinqa_fields(raw_example: dict, question_id: int) -> dict:
         "question": raw_example["Question"],
         "gold_answer": raw_example["Answer"],
         "document_text": raw_example["Context"],
+        "document_id": hashlib.sha256(raw_example["Context"].encode("utf-8")).hexdigest(),
         "program": raw_example["Program"],
     }
 
@@ -159,3 +161,22 @@ def iter_docfinqa_examples(
 
             yielded += 1
             yield convert_docfinqa_fields(raw_example, current_index)
+
+
+def iter_unique_documents() -> Iterator[dict]:
+    """
+    Streams each unique DocFinQA document once, deduplicated by document_id
+    across the train_dev and test splits.
+    """
+
+    seen_document_ids: set[str] = set()
+
+    for split in (TUNING_SPLIT, BASELINE_SPLIT):
+        for example in iter_docfinqa_examples(split=split):
+            if example["document_id"] in seen_document_ids:
+                continue
+            seen_document_ids.add(example["document_id"])
+            yield {
+                "document_id": example["document_id"],
+                "document_text": example["document_text"],
+            }

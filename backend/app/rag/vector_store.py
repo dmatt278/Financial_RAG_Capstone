@@ -1,10 +1,11 @@
+import itertools
 import os
 from pathlib import Path
 from typing import Any
 
-from app.data.data_loader import TUNING_SPLIT, iter_docfinqa_examples
+from app.data.data_loader import iter_unique_documents
 from app.rag.chunker import chunk_document
-from app.rag.embedder import embed_texts
+from app.rag.embedder import embed_documents
 
 
 DEFAULT_COLLECTION_NAME = "docfinqa_chunks"
@@ -71,36 +72,34 @@ def count_docfinqa_samples(
     collection_name: str = DEFAULT_COLLECTION_NAME,
 ) -> int:
     """
-    Counts unique DocFinQA samples represented in Chroma metadata.
+    Counts unique documents represented in Chroma metadata.
     """
 
-    return len(get_docfinqa_sample_indexes(collection_name=collection_name))
+    return len(get_docfinqa_document_ids(collection_name=collection_name))
 
 
-def get_docfinqa_sample_indexes(
+def get_docfinqa_document_ids(
     collection_name: str = DEFAULT_COLLECTION_NAME,
-) -> list[int]:
+) -> list[str]:
     """
-    Gets unique DocFinQA source indexes represented in Chroma metadata.
+    Gets unique document_ids represented in Chroma metadata.
     """
 
     collection = get_collection(collection_name)
     results = collection.get(include=["metadatas"])
     metadatas = results.get("metadatas", [])
 
-    source_indexes = sorted({
-        metadata["source_index"]
+    document_ids = sorted({
+        metadata["document_id"]
         for metadata in metadatas
-        if metadata and "source_index" in metadata
+        if metadata and "document_id" in metadata
     })
 
-    return source_indexes
+    return document_ids
 
 
 def _chunk_metadata(
-    example: dict[str, Any],
-    split: str,
-    source_index: int,
+    document_id: str,
     chunk: dict[str, Any],
 ) -> dict[str, Any]:
     """
@@ -108,11 +107,7 @@ def _chunk_metadata(
     """
 
     metadata = {
-        "split": split,
-        "source_index": source_index,
-        "question_id": example["question_id"],
-        "question": example["question"],
-        "gold_answer": str(example["gold_answer"]),
+        "document_id": document_id,
         "chunk_id": chunk["chunk_id"],
         "tokens": chunk.get("tokens", 0),
         "strategy": chunk.get("strategy", ""),
@@ -149,78 +144,14 @@ def _upsert_chunks_in_batches(
             ids=ids[start:end],
             documents=batch_documents,
             metadatas=metadatas[start:end],
-            embeddings=embed_texts(batch_documents),
+            embeddings=embed_documents(batch_documents),
         )
         inserted_chunks += len(batch_documents)
 
     return inserted_chunks
 
 
-def insert_docfinqa_examples(
-    split: str = TUNING_SPLIT,
-    start_index: int = 0,
-    limit: int | None = None,
-    strategy: str = "section",
-    chunk_size: int = 512,
-    collection_name: str = DEFAULT_COLLECTION_NAME,
-    reset: bool = False,
-) -> dict[str, Any]:
-    """
-    Streams DocFinQA examples, chunks their text, embeds chunks, and stores them in Chroma.
-    """
-
-    collection = reset_collection(collection_name) if reset else get_collection(collection_name)
-
-    ids: list[str] = []
-    documents: list[str] = []
-    metadatas: list[dict[str, Any]] = []
-    inserted_examples = 0
-    inserted_chunks = 0
-
-    for source_index, example in enumerate(
-        iter_docfinqa_examples(split=split, start_index=start_index, limit=limit),
-        start=start_index,
-    ):
-        chunks = chunk_document(
-            example["document_text"],
-            strategy=strategy,
-            size=chunk_size,
-        )
-
-        for chunk in chunks:
-            chunk_id = chunk["chunk_id"]
-            ids.append(
-                f"{split}-{example['question_id']}-{strategy}-{chunk_size}-{chunk_id}"
-            )
-            documents.append(chunk["text"])
-            metadatas.append(_chunk_metadata(example, split, source_index, chunk))
-
-        inserted_examples += 1
-
-    if documents:
-        inserted_chunks = _upsert_chunks_in_batches(
-            collection=collection,
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-        )
-
-    return {
-        "collection": collection_name,
-        "persist_path": get_chroma_path(),
-        "split": split,
-        "start_index": start_index,
-        "limit": limit,
-        "strategy": strategy,
-        "chunk_size": chunk_size,
-        "inserted_examples": inserted_examples,
-        "inserted_chunks": inserted_chunks,
-        "collection_count": collection.count(),
-    }
-
-
 def insert_docfinqa_chunk_sweep(
-    split: str = TUNING_SPLIT,
     start_index: int = 0,
     limit: int | None = None,
     strategies: list[str] | None = None,
@@ -229,7 +160,9 @@ def insert_docfinqa_chunk_sweep(
     reset: bool = False,
 ) -> dict[str, Any]:
     """
-    Stores every chunk strategy and chunk size combination for each DocFinQA example.
+    Stores every chunk strategy and chunk size combination for each unique
+    DocFinQA document (deduplicated across splits, so a document shared by
+    multiple questions is only chunked and embedded once).
     """
 
     strategies = strategies or DEFAULT_CHUNK_STRATEGIES
@@ -239,28 +172,27 @@ def insert_docfinqa_chunk_sweep(
     ids: list[str] = []
     documents: list[str] = []
     metadatas: list[dict[str, Any]] = []
-    inserted_examples = 0
+    inserted_documents = 0
     inserted_chunks = 0
     config_results = []
 
-    for source_index, example in enumerate(
-        iter_docfinqa_examples(split=split, start_index=start_index, limit=limit),
-        start=start_index,
-    ):
-        inserted_examples += 1
+    end_index = None if limit is None else start_index + limit
+    document_stream = itertools.islice(iter_unique_documents(), start_index, end_index)
+
+    for document in document_stream:
+        inserted_documents += 1
 
         for strategy in strategies:
             for chunk_size in chunk_sizes:
                 chunks = chunk_document(
-                    example["document_text"],
+                    document["document_text"],
                     strategy=strategy,
                     size=chunk_size,
                 )
 
                 config_results.append(
                     {
-                        "source_index": source_index,
-                        "question_id": example["question_id"],
+                        "document_id": document["document_id"],
                         "strategy": strategy,
                         "chunk_size": chunk_size,
                         "chunks": len(chunks),
@@ -270,10 +202,10 @@ def insert_docfinqa_chunk_sweep(
                 for chunk in chunks:
                     chunk_id = chunk["chunk_id"]
                     ids.append(
-                        f"{split}-{example['question_id']}-{strategy}-{chunk_size}-{chunk_id}"
+                        f"{document['document_id']}-{strategy}-{chunk_size}-{chunk_id}"
                     )
                     documents.append(chunk["text"])
-                    metadatas.append(_chunk_metadata(example, split, source_index, chunk))
+                    metadatas.append(_chunk_metadata(document["document_id"], chunk))
 
                     if len(documents) >= DEFAULT_UPSERT_BATCH_SIZE:
                         inserted_chunks += _upsert_chunks_in_batches(
@@ -297,13 +229,12 @@ def insert_docfinqa_chunk_sweep(
     return {
         "collection": collection_name,
         "persist_path": get_chroma_path(),
-        "split": split,
         "start_index": start_index,
         "limit": limit,
         "strategies": strategies,
         "chunk_sizes": chunk_sizes,
-        "inserted_examples": inserted_examples,
-        "inserted_configs_per_example": len(strategies) * len(chunk_sizes),
+        "inserted_documents": inserted_documents,
+        "inserted_configs_per_document": len(strategies) * len(chunk_sizes),
         "inserted_chunks": inserted_chunks,
         "collection_count": collection.count(),
         "config_results": config_results,

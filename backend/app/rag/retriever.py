@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 from typing import Literal
 from app.data.data_loader import load_docfinqa_example
 from app.rag.chunker import chunk_document
-from app.rag.embedder import embed_texts
+from app.rag.embedder import embed_queries
 from app.rag.vector_store import DEFAULT_COLLECTION_NAME, get_collection
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
@@ -128,7 +128,7 @@ def keyword_search(collection, question, top_k, where):
 
 def semantic_search(collection, question, top_k, where):
     result = collection.query(
-        query_embeddings=embed_texts([question]),
+        query_embeddings=embed_queries([question]),
         n_results=top_k,
         where=where,
         include=["documents", "metadatas", "distances"],
