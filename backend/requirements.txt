@@ -9,5 +9,6 @@ tiktoken
 chromadb
 sentence-transformers>=2.7.0
 transformers>=4.51.0
+einops
 openai
 rank-bm25
