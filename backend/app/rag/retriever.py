@@ -1,19 +1,53 @@
+import os
 import re
+from functools import lru_cache
 from typing import Any, Dict, List
 from typing import Literal
 from app.data.data_loader import load_docfinqa_example
 from app.rag.chunker import chunk_document
-from app.rag.embedder import embed_queries
+from app.rag.embedder import embed_queries, get_inference_device
 from app.rag.vector_store import DEFAULT_COLLECTION_NAME, get_collection
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
-from functools import lru_cache
-from sentence_transformers import CrossEncoder
+
+
+DEFAULT_RERANKER_BATCH_SIZE = 16
+
+
+def get_reranker_batch_size() -> int:
+    """Returns a positive inference batch size suitable for the reranker."""
+
+    raw_value = os.getenv(
+        "RERANKER_BATCH_SIZE",
+        str(DEFAULT_RERANKER_BATCH_SIZE),
+    )
+    try:
+        batch_size = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "RERANKER_BATCH_SIZE must be a positive integer."
+        ) from exc
+
+    if batch_size <= 0:
+        raise RuntimeError(
+            "RERANKER_BATCH_SIZE must be a positive integer."
+        )
+    return batch_size
 
 
 @lru_cache(maxsize=1)
 def get_reranker():
-    return CrossEncoder("BAAI/bge-reranker-v2-m3")
+    return CrossEncoder(
+        "BAAI/bge-reranker-v2-m3",
+        device=get_inference_device(),
+    )
+
+
+@lru_cache(maxsize=128)
+def _cached_query_embedding(question: str) -> tuple[float, ...]:
+    """Embeds a repeated sweep question once without changing its ranking."""
+
+    return tuple(embed_queries([question])[0])
 
 
 def _format_chroma_results(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -157,7 +191,7 @@ def keyword_search(collection, question, top_k, where):
 
 def semantic_search(collection, question, top_k, where):
     result = collection.query(
-        query_embeddings=embed_queries([question]),
+        query_embeddings=[list(_cached_query_embedding(question))],
         n_results=top_k,
         where=where,
         include=["documents", "metadatas", "distances"],
@@ -197,7 +231,11 @@ def cross_encoder_reranker(chunks, question, top_k):
 
     model = get_reranker()
     combined = [(question, chunk["text"]) for chunk in chunks]
-    scores = model.predict(combined)
+    scores = model.predict(
+        combined,
+        batch_size=get_reranker_batch_size(),
+        show_progress_bar=False,
+    )
 
     for chunk, score in zip(chunks, scores):
         chunk["rerank_score"] = float(score)
