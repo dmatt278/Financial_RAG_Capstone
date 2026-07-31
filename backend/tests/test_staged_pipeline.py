@@ -1,0 +1,838 @@
+import os
+import sys
+import unittest
+import importlib.util
+from importlib.machinery import ModuleSpec
+from pathlib import Path
+from types import ModuleType
+from unittest.mock import patch
+
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+
+def _stub_module(name, **attributes):
+    if importlib.util.find_spec(name) is not None:
+        return
+    module = ModuleType(name)
+    for attribute_name, value in attributes.items():
+        setattr(module, attribute_name, value)
+    sys.modules[name] = module
+
+
+_stub_module("ijson", items=lambda *_args, **_kwargs: iter(()))
+_stub_module("huggingface_hub", hf_hub_download=lambda **_kwargs: "")
+_stub_module("rank_bm25", BM25Okapi=object)
+_stub_module("sentence_transformers", CrossEncoder=object)
+
+if importlib.util.find_spec("llama_index") is None:
+    llama_index_stub = ModuleType("llama_index")
+    llama_index_core_stub = ModuleType("llama_index.core")
+    node_parser_stub = ModuleType("llama_index.core.node_parser")
+    node_parser_stub.TokenTextSplitter = object
+    node_parser_stub.SentenceSplitter = object
+    llama_index_core_stub.node_parser = node_parser_stub
+    llama_index_stub.core = llama_index_core_stub
+    sys.modules["llama_index"] = llama_index_stub
+    sys.modules["llama_index.core"] = llama_index_core_stub
+    sys.modules["llama_index.core.node_parser"] = node_parser_stub
+
+if importlib.util.find_spec("psycopg2") is None:
+    psycopg2_stub = ModuleType("psycopg2")
+    psycopg2_stub.__spec__ = ModuleSpec("psycopg2", loader=None)
+    psycopg2_stub.connect = lambda *_args, **_kwargs: None
+    extras_stub = ModuleType("psycopg2.extras")
+    extras_stub.__spec__ = ModuleSpec("psycopg2.extras", loader=None)
+    extras_stub.Json = lambda value: value
+    extras_stub.RealDictCursor = object
+    extras_stub.execute_values = lambda *_args, **_kwargs: None
+    psycopg2_stub.extras = extras_stub
+    sys.modules["psycopg2"] = psycopg2_stub
+    sys.modules["psycopg2.extras"] = extras_stub
+
+
+from app.rag.pipeline import (  # noqa: E402
+    DEV_SHORTLIST_EXPERIMENT,
+    RETRIEVAL_SHORTLIST_SIZE,
+    STAGE_2_ANALYSIS_NAME,
+    STAGE_3_ANALYSIS_NAME,
+    full_rag_parameter_sweep,
+    full_rag_shortlist_sweep,
+    full_rag_with_math_agent,
+    get_baseline_results,
+    top_chunks,
+)
+
+
+def _example():
+    return {
+        "question_id": "1",
+        "question": "What is the value?",
+        "gold_answer": "10",
+        "document_id": "document-1",
+    }
+
+
+def _chunks(count=10):
+    return [
+        {
+            "id": f"chunk-{index}",
+            "chunk_id": f"chunk-{index}",
+            "text": f"chunk text {index}",
+            "score": 1.0,
+            "metadata": {},
+        }
+        for index in range(count)
+    ]
+
+
+def _retrieval_metrics():
+    return {
+        "all_evidence_hit_at_k": 1.0,
+        "evidence_recall_at_k": 1.0,
+        "reciprocal_rank": 1.0,
+        "precision_at_k": 1.0,
+    }
+
+
+class StagedPipelineTests(unittest.TestCase):
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline.get_top_k_chunks")
+    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    def test_retrieval_sweep_includes_off_and_all_reranker_pools(
+        self,
+        iter_examples,
+        evidence_alignment,
+        get_top_k,
+        evaluate_retrieval,
+    ):
+        iter_examples.return_value = iter([_example()])
+        evidence_alignment.return_value = []
+        get_top_k.return_value = _chunks()
+        evaluate_retrieval.return_value = _retrieval_metrics()
+
+        summary = top_chunks(
+            split="train",
+            top_k_values=[3],
+            strategies=["fixed"],
+            retrieval_methods=["semantic"],
+            chunk_size=512,
+            log_results=False,
+            return_results=True,
+        )
+
+        self.assertEqual(summary["parameter_combinations_per_question"], 4)
+        self.assertEqual(
+            summary["reranker_configurations"],
+            [
+                {
+                    "reranker_enabled": False,
+                    "reranker_pool_size": None,
+                },
+                {
+                    "reranker_enabled": True,
+                    "reranker_pool_size": 10,
+                },
+                {
+                    "reranker_enabled": True,
+                    "reranker_pool_size": 20,
+                },
+                {
+                    "reranker_enabled": True,
+                    "reranker_pool_size": 40,
+                },
+            ],
+        )
+        self.assertEqual(get_top_k.call_count, 4)
+        self.assertEqual(
+            {
+                (
+                    result["reranker_used"],
+                    result["reranker_pool_size"],
+                )
+                for result in summary["results"]
+            },
+            {
+                (False, None),
+                (True, 10),
+                (True, 20),
+                (True, 40),
+            },
+        )
+        self.assertFalse(summary["shortlist_saved"])
+        self.assertEqual(
+            summary["shortlist_save_reason"],
+            "result_logging_disabled",
+        )
+
+    @patch("app.rag.pipeline.complete_experiment_run")
+    @patch(
+        "app.rag.pipeline.start_experiment_run",
+        return_value="train-run-id",
+    )
+    @patch("app.rag.pipeline.log_question_results", return_value=[1])
+    @patch("app.rag.pipeline.create_results_table")
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline.get_top_k_chunks")
+    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    def test_partial_retrieval_run_is_tracked_but_not_marked_full(
+        self,
+        iter_examples,
+        evidence_alignment,
+        get_top_k,
+        evaluate_retrieval,
+        _create_table,
+        log_results,
+        start_run,
+        complete_run,
+    ):
+        iter_examples.return_value = iter([_example()])
+        evidence_alignment.return_value = []
+        get_top_k.return_value = _chunks()
+        evaluate_retrieval.return_value = _retrieval_metrics()
+
+        summary = top_chunks(
+            split="train",
+            top_k_values=[3],
+            strategies=["fixed"],
+            retrieval_methods=["semantic"],
+            reranker_enabled_values=[False],
+            chunk_size=512,
+            log_results=True,
+            return_results=True,
+        )
+
+        self.assertEqual(summary["run_id"], "train-run-id")
+        self.assertFalse(summary["is_full_run"])
+        self.assertEqual(summary["rows_saved"], 1)
+        self.assertEqual(summary["results"][0]["run_id"], "train-run-id")
+        start_run.assert_called_once_with(
+            dataset="docfinqa",
+            experiment_name="top_chunks_evidence_sweep",
+            split="train",
+            model=None,
+        )
+        complete_run.assert_called_once_with(
+            run_id="train-run-id",
+            questions_processed=1,
+            rows_saved=1,
+            is_full_run=False,
+        )
+
+    @patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o-mini"},
+    )
+    @patch("app.rag.pipeline.evaluate_docfinqa_answer_metrics")
+    @patch("app.rag.pipeline.generate_answer")
+    @patch("app.rag.pipeline.limit_chunks_to_prompt_budget")
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline.get_top_k_chunks")
+    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    def test_generation_sweep_runs_only_complete_candidate_configs(
+        self,
+        iter_examples,
+        evidence_alignment,
+        get_top_k,
+        evaluate_retrieval,
+        limit_prompt,
+        generate_answer,
+        evaluate_answer,
+    ):
+        iter_examples.return_value = iter([_example()])
+        evidence_alignment.return_value = []
+        get_top_k.return_value = _chunks()
+        evaluate_retrieval.return_value = _retrieval_metrics()
+        limit_prompt.side_effect = lambda **kwargs: kwargs["retrieved_chunks"]
+        generate_answer.return_value = "10"
+        evaluate_answer.return_value = {
+            "docfinqa_answer_correct": True,
+            "within_one_percent": True,
+        }
+        candidate_configs = [
+            {
+                "chunk_size": 512,
+                "strategy": "section",
+                "retrieval_method": "hybrid",
+                "top_k": 3,
+                "reranker_enabled": False,
+                "reranker_pool_size": None,
+            },
+            {
+                "chunk_size": 1024,
+                "strategy": "fixed",
+                "retrieval_method": "semantic",
+                "top_k": 5,
+                "reranker_enabled": True,
+                "reranker_pool_size": 20,
+            },
+        ]
+
+        summary = full_rag_parameter_sweep(
+            split="dev",
+            candidate_configs=candidate_configs,
+            log_results=False,
+        )
+
+        self.assertEqual(summary["parameter_combinations_per_question"], 2)
+        self.assertEqual(summary["rows_processed"], 2)
+        self.assertFalse(summary["statistical_analysis_saved"])
+        self.assertEqual(
+            summary["statistical_analysis_save_reason"],
+            "result_logging_disabled",
+        )
+        self.assertEqual(get_top_k.call_count, 2)
+        called_configs = {
+            (
+                call.kwargs["top_k"],
+                call.kwargs["retrieval_method"],
+                call.kwargs["reranker_enabled"],
+                call.kwargs["reranker_pool_size"],
+            )
+            for call in get_top_k.call_args_list
+        }
+        self.assertEqual(
+            called_configs,
+            {
+                (3, "hybrid", False, 20),
+                (5, "semantic", True, 20),
+            },
+        )
+
+    @patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o-mini"},
+    )
+    @patch("app.rag.pipeline.complete_experiment_run")
+    @patch(
+        "app.rag.pipeline.start_experiment_run",
+        return_value="dev-run-id",
+    )
+    @patch("app.rag.pipeline.save_best_rag_parameters")
+    @patch("app.rag.pipeline.save_statistical_analysis")
+    @patch("app.rag.pipeline.log_question_results")
+    @patch("app.rag.pipeline.create_results_table")
+    @patch("app.rag.pipeline.evaluate_docfinqa_answer_metrics")
+    @patch("app.rag.pipeline.generate_answer")
+    @patch("app.rag.pipeline.limit_chunks_to_prompt_budget")
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline.get_top_k_chunks")
+    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    def test_complete_dev_shortlist_saves_statistics_without_changing_winner(
+        self,
+        iter_examples,
+        evidence_alignment,
+        get_top_k,
+        evaluate_retrieval,
+        limit_prompt,
+        generate_answer,
+        evaluate_answer,
+        _create_table,
+        log_results,
+        save_statistics,
+        save_best,
+        start_run,
+        complete_run,
+    ):
+        iter_examples.return_value = iter(
+            [
+                _example(),
+                {
+                    **_example(),
+                    "question_id": "2",
+                    "question": "What is the second value?",
+                },
+            ]
+        )
+        evidence_alignment.return_value = []
+
+        def retrieve(**kwargs):
+            chunk_size = kwargs["where"]["$and"][2]["chunk_size"]["$eq"]
+            chunks = _chunks()
+            chunks[0]["text"] = str(chunk_size)
+            return chunks
+
+        get_top_k.side_effect = retrieve
+        evaluate_retrieval.return_value = _retrieval_metrics()
+        limit_prompt.side_effect = lambda **kwargs: kwargs["retrieved_chunks"]
+        generate_answer.side_effect = lambda **kwargs: (
+            "10"
+            if kwargs["retrieved_chunks"][0]["text"] == "256"
+            else "wrong"
+        )
+        evaluate_answer.side_effect = lambda generated_answer, **_kwargs: {
+            "docfinqa_answer_correct": generated_answer == "10",
+            "within_one_percent": generated_answer == "10",
+        }
+        log_results.side_effect = lambda results, ensure_table=False: list(
+            range(1, len(results) + 1)
+        )
+        candidate_configs = [
+            {
+                "chunk_size": 256 + index,
+                "strategy": "section",
+                "retrieval_method": "hybrid",
+                "top_k": 5,
+                "reranker_enabled": False,
+                "reranker_pool_size": None,
+            }
+            for index in range(RETRIEVAL_SHORTLIST_SIZE)
+        ]
+
+        summary = full_rag_parameter_sweep(
+            split="dev",
+            candidate_configs=candidate_configs,
+            experiment_name=DEV_SHORTLIST_EXPERIMENT,
+            winner_source_split="dev",
+            return_results=True,
+        )
+
+        self.assertEqual(summary["best_parameters"]["chunk_size"], 256)
+        self.assertEqual(
+            summary["statistical_analysis"]["pairwise"]["family_size"],
+            66,
+        )
+        self.assertFalse(
+            summary["statistical_analysis"][
+                "statistics_used_to_select_winner"
+            ]
+        )
+        self.assertTrue(summary["statistical_analysis_saved"])
+        self.assertEqual(summary["run_id"], "dev-run-id")
+        self.assertTrue(summary["is_full_run"])
+        start_run.assert_called_once_with(
+            dataset="docfinqa",
+            experiment_name=DEV_SHORTLIST_EXPERIMENT,
+            split="dev",
+            model="gpt-4o-mini",
+        )
+        self.assertEqual(len(summary["results"]), 24)
+        self.assertTrue(
+            all(
+                result["run_id"] == "dev-run-id"
+                for result in summary["results"]
+            )
+        )
+        save_statistics.assert_called_once()
+        self.assertEqual(
+            save_statistics.call_args.kwargs["run_id"],
+            "dev-run-id",
+        )
+        self.assertEqual(
+            save_statistics.call_args.kwargs["analysis_name"],
+            STAGE_2_ANALYSIS_NAME,
+        )
+        save_best.assert_called_once()
+        self.assertEqual(save_best.call_args.kwargs["run_id"], "dev-run-id")
+        self.assertEqual(save_best.call_args.kwargs["config"]["chunk_size"], 256)
+        complete_run.assert_called_once_with(
+            run_id="dev-run-id",
+            questions_processed=2,
+            rows_saved=24,
+            is_full_run=True,
+        )
+
+    @patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o-mini"},
+    )
+    @patch("app.rag.pipeline.complete_experiment_run")
+    @patch(
+        "app.rag.pipeline.start_experiment_run",
+        return_value="math-run-id",
+    )
+    @patch("app.rag.pipeline.save_statistical_analysis")
+    @patch(
+        "app.rag.pipeline.log_question_results",
+        return_value=[1, 2],
+    )
+    @patch("app.rag.pipeline.create_results_table")
+    @patch("app.rag.pipeline.evaluate_docfinqa_answer_metrics")
+    @patch("app.rag.pipeline.math_agent")
+    @patch("app.rag.pipeline.generate_answer")
+    @patch("app.rag.pipeline.limit_chunks_to_prompt_budget")
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline.get_top_k_chunks")
+    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    def test_complete_math_agent_run_uses_one_run_id(
+        self,
+        iter_examples,
+        evidence_alignment,
+        get_top_k,
+        evaluate_retrieval,
+        limit_chunks,
+        generate_answer,
+        run_math_agent,
+        evaluate_answer,
+        _create_table,
+        log_results,
+        save_statistics,
+        start_run,
+        complete_run,
+    ):
+        iter_examples.return_value = iter([_example()])
+        evidence_alignment.return_value = []
+        get_top_k.return_value = _chunks(3)
+        limit_chunks.side_effect = lambda **kwargs: list(
+            kwargs["retrieved_chunks"]
+        )
+        evaluate_retrieval.return_value = _retrieval_metrics()
+
+        def generate_direct(
+            question,
+            retrieved_chunks,
+            generation_context_metrics=None,
+        ):
+            if generation_context_metrics is not None:
+                generation_context_metrics.update(
+                    {
+                        "source_context_chunk_count": len(retrieved_chunks),
+                        "generation_context_chunk_count": len(
+                            retrieved_chunks
+                        ),
+                        "generation_context_chunk_ids": [
+                            chunk["id"] for chunk in retrieved_chunks
+                        ],
+                        "prompt_was_truncated": False,
+                    }
+                )
+            return "10"
+
+        generate_answer.side_effect = generate_direct
+        run_math_agent.return_value = {
+            "answer": "10",
+            "model": "gpt-4o-mini",
+            "prompt_version": "test",
+            "status": "ok",
+            "program": [],
+            "raw_answer": 10,
+            "raw_model_output": "{}",
+            "program_parse_succeeded": True,
+            "execution_succeeded": True,
+            "error": None,
+            "execution_steps": [],
+            "literal_operand_count": 1,
+            "grounded_operand_count": 1,
+            "operand_grounding_rate": 1.0,
+            "ungrounded_operands": [],
+            "generation_context_chunk_ids": [
+                "chunk-0",
+                "chunk-1",
+                "chunk-2",
+            ],
+            "generation_context_chunk_count": 3,
+            "prompt_was_truncated": False,
+        }
+        evaluate_answer.side_effect = lambda **_kwargs: {
+            "docfinqa_answer_correct": True,
+        }
+
+        summary = full_rag_with_math_agent(
+            split="dev",
+            start_index=0,
+            limit=None,
+            top_k_values=[3],
+            strategies=["fixed"],
+            retrieval_methods=["semantic"],
+            log_results=True,
+            return_results=True,
+        )
+
+        self.assertEqual(summary["run_id"], "math-run-id")
+        self.assertTrue(summary["is_full_run"])
+        self.assertEqual(summary["rows_processed"], 2)
+        self.assertEqual(summary["rows_saved"], 2)
+        self.assertEqual(summary["results_returned"], 2)
+        self.assertEqual(
+            {
+                result["generation_metrics"]["comparison_method"]
+                for result in summary["results"]
+            },
+            {"direct_llm", "math_agent"},
+        )
+        self.assertEqual(
+            generate_answer.call_args.kwargs["retrieved_chunks"],
+            run_math_agent.call_args.kwargs["chunks"],
+        )
+        self.assertEqual(log_results.call_count, 1)
+        self.assertEqual(
+            start_run.call_args.kwargs["experiment_name"],
+            "full_rag_math_tool_agent",
+        )
+        self.assertEqual(start_run.call_args.kwargs["split"], "dev")
+        self.assertEqual(
+            start_run.call_args.kwargs["parameters"]["comparison_methods"],
+            ["direct_llm", "math_agent"],
+        )
+        save_statistics.assert_called_once()
+        self.assertIn(
+            "math_agent_vs_direct_llm__",
+            save_statistics.call_args.kwargs["analysis_name"],
+        )
+        complete_run.assert_called_once_with(
+            run_id="math-run-id",
+            questions_processed=1,
+            rows_saved=2,
+            is_full_run=True,
+        )
+
+        iter_examples.return_value = iter([_example()])
+        partial_summary = full_rag_with_math_agent(
+            split="dev",
+            start_index=0,
+            limit=1,
+            top_k_values=[3],
+            strategies=["fixed"],
+            retrieval_methods=["semantic"],
+            log_results=False,
+            return_results=False,
+        )
+        self.assertFalse(partial_summary["is_full_run"])
+        self.assertEqual(partial_summary["statistical_analyses_saved"], 0)
+        self.assertEqual(partial_summary["results_returned"], 0)
+
+    @patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o-mini"},
+    )
+    @patch("app.rag.pipeline.complete_experiment_run")
+    @patch(
+        "app.rag.pipeline.start_experiment_run",
+        return_value="test-run-id",
+    )
+    @patch("app.rag.pipeline.save_statistical_analysis")
+    @patch("app.rag.pipeline.log_question_result", return_value=1)
+    @patch("app.rag.pipeline.create_results_table")
+    @patch("app.rag.pipeline.evaluate_docfinqa_answer_metrics")
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.get_top_k_chunks")
+    @patch("app.rag.pipeline.generate_answer")
+    @patch("app.rag.pipeline.generate_no_context_answer")
+    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    @patch("app.rag.pipeline.get_best_rag_parameters")
+    def test_stage_three_compares_frozen_winner_with_three_baselines(
+        self,
+        get_best,
+        iter_examples,
+        generate_no_context,
+        generate_answer,
+        get_top_k,
+        evidence_alignment,
+        evaluate_retrieval,
+        evaluate_answer,
+        _create_table,
+        _log_result,
+        save_statistics,
+        start_run,
+        complete_run,
+    ):
+        get_best.return_value = {
+            "source_experiment": DEV_SHORTLIST_EXPERIMENT,
+            "retrieval_method": "hybrid",
+            "reranker_used": True,
+            "chunk_strategy": "section",
+            "chunk_size": 512,
+            "top_k": 5,
+            "reranker_pool_size": 20,
+            "source_split": "dev",
+            "selection_metrics": {"accuracy": 0.75},
+        }
+        examples = [
+            {
+                **_example(),
+                "question_id": str(index),
+                "question": f"q{index}",
+                "gold_answer": f"q{index}",
+                "document_text": "full_document",
+            }
+            for index in range(4)
+        ]
+        iter_examples.side_effect = [iter(examples) for _ in range(4)]
+        generate_no_context.side_effect = lambda question: (
+            f"no_context:{question}"
+        )
+
+        def retrieve(**kwargs):
+            chunks = _chunks()
+            chunks[0]["text"] = (
+                "naive_rag"
+                if kwargs["retrieval_method"] == "semantic"
+                else "optimized_rag"
+            )
+            return chunks
+
+        get_top_k.side_effect = retrieve
+
+        def generate(
+            question,
+            retrieved_chunks,
+            generation_context_metrics=None,
+        ):
+            if generation_context_metrics is not None:
+                generation_context_metrics.update(
+                    {
+                        "source_context_chunk_count": len(
+                            retrieved_chunks
+                        ),
+                        "generation_context_chunk_count": len(
+                            retrieved_chunks
+                        ),
+                        "generation_context_chunk_ids": [
+                            chunk.get("chunk_id")
+                            for chunk in retrieved_chunks
+                        ],
+                        "prompt_was_truncated": False,
+                    }
+                )
+            return f"{retrieved_chunks[0]['text']}:{question}"
+
+        generate_answer.side_effect = generate
+        evidence_alignment.return_value = []
+        evaluate_retrieval.return_value = _retrieval_metrics()
+        correct_questions = {
+            "no_context": {"q0"},
+            "full_document": {"q0", "q1"},
+            "naive_rag": {"q0", "q1", "q2"},
+            "optimized_rag": {"q0", "q1", "q2", "q3"},
+        }
+
+        def evaluate(generated_answer, gold_answer):
+            method, _, _question = generated_answer.partition(":")
+            is_correct = gold_answer in correct_questions[method]
+            return {
+                "docfinqa_answer_correct": is_correct,
+                "within_one_percent": is_correct,
+            }
+
+        evaluate_answer.side_effect = evaluate
+
+        summary = get_baseline_results()
+
+        analysis = summary["statistical_analysis"]
+        self.assertEqual(analysis["systems_compared"], 4)
+        self.assertEqual(analysis["primary_system"], "optimized_rag")
+        self.assertEqual(analysis["pairwise"]["family_size"], 3)
+        self.assertTrue(analysis["optimized_parameters_frozen_before_test"])
+        self.assertTrue(summary["statistical_analysis_saved"])
+        self.assertEqual(summary["run_id"], "test-run-id")
+        self.assertTrue(summary["is_full_run"])
+        start_run.assert_called_once_with(
+            dataset="docfinqa",
+            experiment_name="baseline",
+            split="test",
+            model="gpt-4o-mini",
+        )
+        self.assertEqual(_log_result.call_count, 16)
+        full_document_rows = [
+            call.args[0]
+            for call in _log_result.call_args_list
+            if call.args[0]["generation_metrics"].get("baseline")
+            == "full_document"
+        ]
+        self.assertEqual(len(full_document_rows), 4)
+        self.assertTrue(
+            all(
+                row["generation_metrics"]["prompt_was_truncated"]
+                is False
+                for row in full_document_rows
+            )
+        )
+        self.assertTrue(
+            all(
+                call.args[0]["run_id"] == "test-run-id"
+                for call in _log_result.call_args_list
+            )
+        )
+        save_statistics.assert_called_once()
+        self.assertEqual(
+            save_statistics.call_args.kwargs["run_id"],
+            "test-run-id",
+        )
+        self.assertEqual(
+            save_statistics.call_args.kwargs["analysis_name"],
+            STAGE_3_ANALYSIS_NAME,
+        )
+        self.assertEqual(save_statistics.call_args.kwargs["source_split"], "test")
+        complete_run.assert_called_once_with(
+            run_id="test-run-id",
+            questions_processed=4,
+            rows_saved=16,
+            is_full_run=True,
+        )
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"})
+    @patch("app.rag.pipeline.get_best_rag_parameters")
+    def test_stage_three_rejects_non_shortlist_dev_parameters(self, get_best):
+        get_best.return_value = {
+            "source_experiment": "legacy_dev_experiment",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "12-candidate dev shortlist"):
+            get_baseline_results()
+
+    @patch("app.rag.pipeline.full_rag_parameter_sweep")
+    @patch("app.rag.pipeline.get_retrieval_shortlist")
+    def test_dev_sweep_loads_exact_saved_twelve(
+        self,
+        get_shortlist,
+        run_sweep,
+    ):
+        candidates = [
+            {
+                "chunk_size": 256 + index,
+                "strategy": "section",
+                "retrieval_method": "hybrid",
+                "top_k": 5,
+                "reranker_enabled": False,
+                "reranker_pool_size": None,
+            }
+            for index in range(RETRIEVAL_SHORTLIST_SIZE)
+        ]
+        get_shortlist.return_value = {
+            "source_experiment": "top_chunks_evidence_sweep",
+            "source_split": "train",
+            "questions_run": 5735,
+            "updated_at": "2026-07-30",
+            "candidates": candidates,
+        }
+        run_sweep.return_value = {"rows_processed": 0}
+
+        summary = full_rag_shortlist_sweep()
+
+        self.assertEqual(
+            len(run_sweep.call_args.kwargs["candidate_configs"]),
+            RETRIEVAL_SHORTLIST_SIZE,
+        )
+        self.assertEqual(run_sweep.call_args.kwargs["split"], "dev")
+        self.assertEqual(
+            run_sweep.call_args.kwargs["experiment_name"],
+            DEV_SHORTLIST_EXPERIMENT,
+        )
+        self.assertEqual(
+            run_sweep.call_args.kwargs["winner_source_split"],
+            "dev",
+        )
+        self.assertEqual(
+            summary["retrieval_shortlist_source"]["questions_run"],
+            5735,
+        )
+
+    @patch("app.rag.pipeline.get_retrieval_shortlist", return_value=None)
+    def test_dev_sweep_requires_completed_train_shortlist(self, _shortlist):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Run POST /run-chunk-rag first",
+        ):
+            full_rag_shortlist_sweep()
+
+
+if __name__ == "__main__":
+    unittest.main()

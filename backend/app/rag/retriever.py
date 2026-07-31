@@ -46,6 +46,35 @@ def _format_chroma_results(result: dict[str, Any]) -> list[dict[str, Any]]:
     return retrieved
 
 
+def get_all_chunks(
+    where: dict[str, Any],
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+) -> list[dict[str, Any]]:
+    """Gets every stored chunk matching one document chunk configuration."""
+
+    collection = get_collection(collection_name)
+    result = collection.get(
+        where=where,
+        include=["documents", "metadatas"],
+    )
+
+    return [
+        {
+            "id": chunk_id,
+            "chunk_id": metadata.get("chunk_id"),
+            "distance": None,
+            "score": None,
+            "text": document,
+            "metadata": metadata,
+        }
+        for chunk_id, document, metadata in zip(
+            result.get("ids", []),
+            result.get("documents", []),
+            result.get("metadatas", []),
+        )
+    ]
+
+
 def get_top_k_chunks(
     question: str,
     top_k: int = 3,
