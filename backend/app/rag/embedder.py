@@ -4,7 +4,7 @@ from functools import lru_cache
 
 
 DEFAULT_EMBEDDING_MODEL = "jinaai/jina-embeddings-v2-small-en"
-DEFAULT_EMBEDDING_BATCH_SIZE = 8
+DEFAULT_EMBEDDING_BATCH_SIZE = 1
 DEFAULT_INFERENCE_DEVICE = "auto"
 
 
@@ -41,6 +41,28 @@ def get_inference_device() -> str:
     return configured_device
 
 
+def get_embedding_batch_size() -> int:
+    """Returns the configured embedding batch size."""
+
+    raw_value = os.getenv(
+        "EMBEDDING_BATCH_SIZE",
+        str(DEFAULT_EMBEDDING_BATCH_SIZE),
+    )
+    try:
+        batch_size = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "EMBEDDING_BATCH_SIZE must be a positive integer."
+        ) from exc
+
+    if batch_size <= 0:
+        raise RuntimeError(
+            "EMBEDDING_BATCH_SIZE must be a positive integer."
+        )
+
+    return batch_size
+
+
 @lru_cache(maxsize=1)
 def _get_sentence_transformer():
     """
@@ -72,7 +94,7 @@ def embed_documents(texts: list[str]) -> list[list[float]]:
     model = _get_sentence_transformer()
     return model.encode(
         texts,
-        batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
+        batch_size=get_embedding_batch_size(),
         normalize_embeddings=True,
     ).tolist()
 
@@ -85,6 +107,6 @@ def embed_queries(texts: list[str]) -> list[list[float]]:
     model = _get_sentence_transformer()
     return model.encode(
         texts,
-        batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
+        batch_size=get_embedding_batch_size(),
         normalize_embeddings=True,
     ).tolist()

@@ -69,6 +69,48 @@ class InferenceDeviceTests(unittest.TestCase):
             with patch("app.rag.embedder._get_torch", return_value=torch):
                 self.assertEqual(embedder.get_inference_device(), "cuda")
 
+    def test_embedding_uses_configured_batch_size(self):
+        model = MagicMock()
+
+        with patch.dict(os.environ, {"EMBEDDING_BATCH_SIZE": "2"}):
+            with patch(
+                "app.rag.embedder._get_sentence_transformer",
+                return_value=model,
+            ):
+                embedder.embed_documents(["one", "two"])
+
+        model.encode.assert_called_once_with(
+            ["one", "two"],
+            batch_size=2,
+            normalize_embeddings=True,
+        )
+
+    def test_query_embedding_uses_configured_batch_size(self):
+        model = MagicMock()
+
+        with patch.dict(os.environ, {"EMBEDDING_BATCH_SIZE": "3"}):
+            with patch(
+                "app.rag.embedder._get_sentence_transformer",
+                return_value=model,
+            ):
+                embedder.embed_queries(["question"])
+
+        model.encode.assert_called_once_with(
+            ["question"],
+            batch_size=3,
+            normalize_embeddings=True,
+        )
+
+    def test_invalid_embedding_batch_size_fails(self):
+        for value in ("0", "-1", "invalid"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"EMBEDDING_BATCH_SIZE": value}):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "positive integer",
+                    ):
+                        embedder.get_embedding_batch_size()
+
     def test_auto_falls_back_to_cpu(self):
         torch = SimpleNamespace(
             cuda=SimpleNamespace(is_available=lambda: False),
