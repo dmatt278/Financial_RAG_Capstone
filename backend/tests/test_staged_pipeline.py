@@ -101,7 +101,7 @@ class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.evaluate_retrieval")
     @patch("app.rag.pipeline.get_top_k_chunks")
     @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
-    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
     def test_retrieval_sweep_includes_off_and_all_reranker_pools(
         self,
         iter_examples,
@@ -174,11 +174,12 @@ class StagedPipelineTests(unittest.TestCase):
         return_value="train-run-id",
     )
     @patch("app.rag.pipeline.log_question_results", return_value=[1])
+    @patch("app.rag.pipeline.update_experiment_run_progress")
     @patch("app.rag.pipeline.create_results_table")
     @patch("app.rag.pipeline.evaluate_retrieval")
     @patch("app.rag.pipeline.get_top_k_chunks")
     @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
-    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
     def test_partial_retrieval_run_is_tracked_but_not_marked_full(
         self,
         iter_examples,
@@ -186,6 +187,7 @@ class StagedPipelineTests(unittest.TestCase):
         get_top_k,
         evaluate_retrieval,
         _create_table,
+        update_progress,
         log_results,
         start_run,
         complete_run,
@@ -208,19 +210,43 @@ class StagedPipelineTests(unittest.TestCase):
 
         self.assertEqual(summary["run_id"], "train-run-id")
         self.assertFalse(summary["is_full_run"])
+        self.assertFalse(summary["is_authoritative"])
         self.assertEqual(summary["rows_saved"], 1)
         self.assertEqual(summary["results"][0]["run_id"], "train-run-id")
-        start_run.assert_called_once_with(
-            dataset="docfinqa",
-            experiment_name="top_chunks_evidence_sweep",
+        iter_examples.assert_called_once_with(
             split="train",
-            model=None,
+            sample_size=300,
+            seed=42,
+        )
+        start_run.assert_called_once()
+        start_arguments = start_run.call_args.kwargs
+        self.assertEqual(start_arguments["dataset"], "docfinqa")
+        self.assertEqual(
+            start_arguments["experiment_name"],
+            "top_chunks_evidence_sweep",
+        )
+        self.assertEqual(start_arguments["split"], "train")
+        self.assertIsNone(start_arguments["model"])
+        self.assertEqual(start_arguments["expected_rows"], 1)
+        self.assertEqual(
+            start_arguments["parameters"]["question_ids"],
+            ["1"],
+        )
+        self.assertEqual(
+            start_arguments["parameters"]["sample_size"],
+            300,
+        )
+        update_progress.assert_called_once_with(
+            run_id="train-run-id",
+            questions_processed=1,
+            rows_saved=1,
         )
         complete_run.assert_called_once_with(
             run_id="train-run-id",
             questions_processed=1,
             rows_saved=1,
             is_full_run=False,
+            is_authoritative=False,
         )
 
     @patch.dict(
@@ -233,7 +259,7 @@ class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.evaluate_retrieval")
     @patch("app.rag.pipeline.get_top_k_chunks")
     @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
-    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
     def test_generation_sweep_runs_only_complete_candidate_configs(
         self,
         iter_examples,
@@ -309,6 +335,99 @@ class StagedPipelineTests(unittest.TestCase):
         {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o-mini"},
     )
     @patch("app.rag.pipeline.complete_experiment_run")
+    @patch("app.rag.pipeline.start_experiment_run")
+    @patch("app.rag.pipeline.resume_experiment_run")
+    @patch("app.rag.pipeline.get_run_results_for_resume")
+    @patch("app.rag.pipeline.log_question_results")
+    @patch("app.rag.pipeline.update_experiment_run_progress")
+    @patch("app.rag.pipeline.create_results_table")
+    @patch("app.rag.pipeline.generate_answer")
+    @patch("app.rag.pipeline.get_top_k_chunks")
+    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment", return_value=[])
+    @patch("app.rag.pipeline._materialize_protocol_examples")
+    def test_resume_skips_an_already_checkpointed_generation_result(
+        self,
+        materialize_examples,
+        _evidence_alignment,
+        get_top_k,
+        generate_answer,
+        _create_table,
+        update_progress,
+        log_results,
+        get_saved_results,
+        resume_run,
+        start_run,
+        complete_run,
+    ):
+        example = _example()
+        materialize_examples.return_value = ([example], ["1"])
+        config = {
+            "chunk_size": 512,
+            "strategy": "fixed",
+            "retrieval_method": "semantic",
+            "top_k": 3,
+            "reranker_enabled": False,
+            "reranker_pool_size": None,
+        }
+        get_saved_results.return_value = [
+            {
+                "result_key": (
+                    "1::semantic__fixed__chunk_512__top_3__"
+                    "reranker_off::generated_answer"
+                ),
+                "question_id": "1",
+                "is_correct": True,
+                "retrieval_method": "semantic",
+                "chunk_strategy": "fixed",
+                "chunk_size": 512,
+                "top_k": 3,
+                "reranker_used": False,
+                "reranker_pool_size": None,
+                "retrieval_metrics": _retrieval_metrics(),
+                "generation_metrics": {"within_one_percent": True},
+            }
+        ]
+
+        summary = full_rag_parameter_sweep(
+            split="dev",
+            candidate_configs=[config],
+            sample_size=1,
+            resume_run_id="resume-run-id",
+        )
+
+        self.assertEqual(summary["run_id"], "resume-run-id")
+        self.assertEqual(summary["rows_already_saved"], 1)
+        self.assertEqual(summary["rows_added_this_attempt"], 0)
+        self.assertEqual(summary["rows_processed"], 0)
+        self.assertEqual(summary["rows_saved"], 1)
+        start_run.assert_not_called()
+        resume_run.assert_called_once()
+        self.assertEqual(
+            resume_run.call_args.kwargs["run_id"],
+            "resume-run-id",
+        )
+        self.assertEqual(
+            resume_run.call_args.kwargs["expected_rows"],
+            1,
+        )
+        get_saved_results.assert_called_once_with("resume-run-id")
+        get_top_k.assert_not_called()
+        generate_answer.assert_not_called()
+        log_results.assert_not_called()
+        update_progress.assert_not_called()
+        complete_run.assert_called_once_with(
+            run_id="resume-run-id",
+            questions_processed=1,
+            rows_saved=1,
+            is_full_run=False,
+            is_authoritative=False,
+        )
+
+    @patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o-mini"},
+    )
+    @patch("app.rag.pipeline.complete_experiment_run")
     @patch(
         "app.rag.pipeline.start_experiment_run",
         return_value="dev-run-id",
@@ -316,6 +435,7 @@ class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.save_best_rag_parameters")
     @patch("app.rag.pipeline.save_statistical_analysis")
     @patch("app.rag.pipeline.log_question_results")
+    @patch("app.rag.pipeline.update_experiment_run_progress")
     @patch("app.rag.pipeline.create_results_table")
     @patch("app.rag.pipeline.evaluate_docfinqa_answer_metrics")
     @patch("app.rag.pipeline.generate_answer")
@@ -323,7 +443,8 @@ class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.evaluate_retrieval")
     @patch("app.rag.pipeline.get_top_k_chunks")
     @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
-    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
+    @patch("app.rag.pipeline.DEV_SAMPLE_SIZE", 2)
     def test_complete_dev_shortlist_saves_statistics_without_changing_winner(
         self,
         iter_examples,
@@ -334,6 +455,7 @@ class StagedPipelineTests(unittest.TestCase):
         generate_answer,
         evaluate_answer,
         _create_table,
+        update_progress,
         log_results,
         save_statistics,
         save_best,
@@ -391,12 +513,13 @@ class StagedPipelineTests(unittest.TestCase):
             experiment_name=DEV_SHORTLIST_EXPERIMENT,
             winner_source_split="dev",
             return_results=True,
+            sample_size=2,
         )
 
         self.assertEqual(summary["best_parameters"]["chunk_size"], 256)
         self.assertEqual(
             summary["statistical_analysis"]["pairwise"]["family_size"],
-            66,
+            3,
         )
         self.assertFalse(
             summary["statistical_analysis"][
@@ -405,14 +528,40 @@ class StagedPipelineTests(unittest.TestCase):
         )
         self.assertTrue(summary["statistical_analysis_saved"])
         self.assertEqual(summary["run_id"], "dev-run-id")
-        self.assertTrue(summary["is_full_run"])
-        start_run.assert_called_once_with(
-            dataset="docfinqa",
-            experiment_name=DEV_SHORTLIST_EXPERIMENT,
+        self.assertFalse(summary["is_full_run"])
+        self.assertTrue(summary["is_authoritative"])
+        iter_examples.assert_called_once_with(
             split="dev",
-            model="gpt-4o-mini",
+            sample_size=2,
+            seed=42,
         )
-        self.assertEqual(len(summary["results"]), 24)
+        start_run.assert_called_once()
+        start_arguments = start_run.call_args.kwargs
+        self.assertEqual(start_arguments["dataset"], "docfinqa")
+        self.assertEqual(
+            start_arguments["experiment_name"],
+            DEV_SHORTLIST_EXPERIMENT,
+        )
+        self.assertEqual(start_arguments["split"], "dev")
+        self.assertEqual(start_arguments["model"], "gpt-4o-mini")
+        self.assertEqual(start_arguments["expected_rows"], 6)
+        self.assertEqual(
+            start_arguments["parameters"]["sample_size"],
+            2,
+        )
+        self.assertEqual(
+            start_arguments["parameters"]["sample_seed"],
+            42,
+        )
+        self.assertEqual(
+            start_arguments["parameters"]["question_ids"],
+            ["1", "2"],
+        )
+        self.assertEqual(
+            len(start_arguments["parameters"]["candidate_configs"]),
+            3,
+        )
+        self.assertEqual(len(summary["results"]), 6)
         self.assertTrue(
             all(
                 result["run_id"] == "dev-run-id"
@@ -431,11 +580,17 @@ class StagedPipelineTests(unittest.TestCase):
         save_best.assert_called_once()
         self.assertEqual(save_best.call_args.kwargs["run_id"], "dev-run-id")
         self.assertEqual(save_best.call_args.kwargs["config"]["chunk_size"], 256)
+        update_progress.assert_called_once_with(
+            run_id="dev-run-id",
+            questions_processed=2,
+            rows_saved=6,
+        )
         complete_run.assert_called_once_with(
             run_id="dev-run-id",
             questions_processed=2,
-            rows_saved=24,
-            is_full_run=True,
+            rows_saved=6,
+            is_full_run=False,
+            is_authoritative=True,
         )
 
     @patch.dict(
@@ -452,6 +607,7 @@ class StagedPipelineTests(unittest.TestCase):
         "app.rag.pipeline.log_question_results",
         return_value=[1, 2],
     )
+    @patch("app.rag.pipeline.update_experiment_run_progress")
     @patch("app.rag.pipeline.create_results_table")
     @patch("app.rag.pipeline.evaluate_docfinqa_answer_metrics")
     @patch("app.rag.pipeline.math_agent")
@@ -460,7 +616,8 @@ class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.evaluate_retrieval")
     @patch("app.rag.pipeline.get_top_k_chunks")
     @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
-    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
+    @patch("app.rag.pipeline.MATH_SAMPLE_SIZE", 1)
     def test_complete_math_agent_run_uses_one_run_id(
         self,
         iter_examples,
@@ -472,6 +629,7 @@ class StagedPipelineTests(unittest.TestCase):
         run_math_agent,
         evaluate_answer,
         _create_table,
+        update_progress,
         log_results,
         save_statistics,
         start_run,
@@ -535,21 +693,23 @@ class StagedPipelineTests(unittest.TestCase):
         }
 
         summary = full_rag_with_math_agent(
-            split="dev",
-            start_index=0,
-            limit=None,
-            top_k_values=[3],
-            strategies=["fixed"],
-            retrieval_methods=["semantic"],
+            split="train_dev",
             log_results=True,
             return_results=True,
+            sample_size=1,
         )
 
         self.assertEqual(summary["run_id"], "math-run-id")
-        self.assertTrue(summary["is_full_run"])
+        self.assertFalse(summary["is_full_run"])
+        self.assertTrue(summary["is_authoritative"])
         self.assertEqual(summary["rows_processed"], 2)
         self.assertEqual(summary["rows_saved"], 2)
         self.assertEqual(summary["results_returned"], 2)
+        iter_examples.assert_called_once_with(
+            split="train_dev",
+            sample_size=1,
+            seed=42,
+        )
         self.assertEqual(
             {
                 result["generation_metrics"]["comparison_method"]
@@ -566,7 +726,28 @@ class StagedPipelineTests(unittest.TestCase):
             start_run.call_args.kwargs["experiment_name"],
             "full_rag_math_tool_agent",
         )
-        self.assertEqual(start_run.call_args.kwargs["split"], "dev")
+        self.assertEqual(start_run.call_args.kwargs["split"], "train_dev")
+        self.assertEqual(start_run.call_args.kwargs["expected_rows"], 2)
+        self.assertEqual(
+            start_run.call_args.kwargs["parameters"]["sample_size"],
+            1,
+        )
+        self.assertEqual(
+            start_run.call_args.kwargs["parameters"]["question_ids"],
+            ["1"],
+        )
+        self.assertEqual(
+            start_run.call_args.kwargs["parameters"]["top_k_values"],
+            [5],
+        )
+        self.assertEqual(
+            start_run.call_args.kwargs["parameters"]["strategies"],
+            ["section"],
+        )
+        self.assertEqual(
+            start_run.call_args.kwargs["parameters"]["retrieval_methods"],
+            ["hybrid"],
+        )
         self.assertEqual(
             start_run.call_args.kwargs["parameters"]["comparison_methods"],
             ["direct_llm", "math_agent"],
@@ -576,25 +757,30 @@ class StagedPipelineTests(unittest.TestCase):
             "math_agent_vs_direct_llm__",
             save_statistics.call_args.kwargs["analysis_name"],
         )
+        update_progress.assert_called_once_with(
+            run_id="math-run-id",
+            questions_processed=1,
+            rows_saved=2,
+        )
         complete_run.assert_called_once_with(
             run_id="math-run-id",
             questions_processed=1,
             rows_saved=2,
-            is_full_run=True,
+            is_full_run=False,
+            is_authoritative=True,
         )
 
         iter_examples.return_value = iter([_example()])
         partial_summary = full_rag_with_math_agent(
-            split="dev",
+            split="train_dev",
             start_index=0,
             limit=1,
-            top_k_values=[3],
-            strategies=["fixed"],
-            retrieval_methods=["semantic"],
             log_results=False,
             return_results=False,
+            sample_size=1,
         )
         self.assertFalse(partial_summary["is_full_run"])
+        self.assertFalse(partial_summary["is_authoritative"])
         self.assertEqual(partial_summary["statistical_analyses_saved"], 0)
         self.assertEqual(partial_summary["results_returned"], 0)
 
@@ -608,7 +794,9 @@ class StagedPipelineTests(unittest.TestCase):
         return_value="test-run-id",
     )
     @patch("app.rag.pipeline.save_statistical_analysis")
-    @patch("app.rag.pipeline.log_question_result", return_value=1)
+    @patch("app.rag.pipeline.log_question_results")
+    @patch("app.rag.pipeline.update_experiment_run_progress")
+    @patch("app.rag.generator.get_openai_client")
     @patch("app.rag.pipeline.create_results_table")
     @patch("app.rag.pipeline.evaluate_docfinqa_answer_metrics")
     @patch("app.rag.pipeline.evaluate_retrieval")
@@ -616,8 +804,9 @@ class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.get_top_k_chunks")
     @patch("app.rag.pipeline.generate_answer")
     @patch("app.rag.pipeline.generate_no_context_answer")
-    @patch("app.rag.pipeline.iter_docfinqa_examples")
+    @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
     @patch("app.rag.pipeline.get_best_rag_parameters")
+    @patch("app.rag.pipeline.TEST_SAMPLE_SIZE", 4)
     def test_stage_three_compares_frozen_winner_with_three_baselines(
         self,
         get_best,
@@ -629,7 +818,9 @@ class StagedPipelineTests(unittest.TestCase):
         evaluate_retrieval,
         evaluate_answer,
         _create_table,
-        _log_result,
+        get_client,
+        update_progress,
+        log_results,
         save_statistics,
         start_run,
         complete_run,
@@ -655,7 +846,14 @@ class StagedPipelineTests(unittest.TestCase):
             }
             for index in range(4)
         ]
-        iter_examples.side_effect = [iter(examples) for _ in range(4)]
+        iter_examples.return_value = iter(examples)
+        saved_rows = []
+
+        def save_batch(results, ensure_table=False):
+            saved_rows.extend(dict(result) for result in results)
+            return list(range(1, len(results) + 1))
+
+        log_results.side_effect = save_batch
         generate_no_context.side_effect = lambda question: (
             f"no_context:{question}"
         )
@@ -714,7 +912,7 @@ class StagedPipelineTests(unittest.TestCase):
 
         evaluate_answer.side_effect = evaluate
 
-        summary = get_baseline_results()
+        summary = get_baseline_results(sample_size=4)
 
         analysis = summary["statistical_analysis"]
         self.assertEqual(analysis["systems_compared"], 4)
@@ -723,19 +921,39 @@ class StagedPipelineTests(unittest.TestCase):
         self.assertTrue(analysis["optimized_parameters_frozen_before_test"])
         self.assertTrue(summary["statistical_analysis_saved"])
         self.assertEqual(summary["run_id"], "test-run-id")
-        self.assertTrue(summary["is_full_run"])
-        start_run.assert_called_once_with(
-            dataset="docfinqa",
-            experiment_name="baseline",
+        self.assertFalse(summary["is_full_run"])
+        self.assertTrue(summary["is_authoritative"])
+        self.assertEqual(summary["rows_saved"], 16)
+        self.assertEqual(summary["rows_added_this_attempt"], 16)
+        iter_examples.assert_called_once_with(
             split="test",
-            model="gpt-4o-mini",
+            sample_size=4,
+            seed=42,
         )
-        self.assertEqual(_log_result.call_count, 16)
+        get_client.assert_called_once_with()
+        start_run.assert_called_once()
+        start_arguments = start_run.call_args.kwargs
+        self.assertEqual(start_arguments["dataset"], "docfinqa")
+        self.assertEqual(start_arguments["experiment_name"], "baseline")
+        self.assertEqual(start_arguments["split"], "test")
+        self.assertEqual(start_arguments["model"], "gpt-4o-mini")
+        self.assertEqual(start_arguments["expected_rows"], 16)
+        self.assertEqual(start_arguments["parameters"]["sample_size"], 4)
+        self.assertEqual(start_arguments["parameters"]["sample_seed"], 42)
+        self.assertEqual(
+            start_arguments["parameters"]["question_ids"],
+            ["0", "1", "2", "3"],
+        )
+        self.assertEqual(
+            start_arguments["parameters"]["baseline_methods"],
+            ["no_context", "full_document", "naive_rag", "optimized_rag"],
+        )
+        self.assertEqual(log_results.call_count, 1)
+        self.assertEqual(len(saved_rows), 16)
         full_document_rows = [
-            call.args[0]
-            for call in _log_result.call_args_list
-            if call.args[0]["generation_metrics"].get("baseline")
-            == "full_document"
+            row
+            for row in saved_rows
+            if row["generation_metrics"].get("baseline") == "full_document"
         ]
         self.assertEqual(len(full_document_rows), 4)
         self.assertTrue(
@@ -747,9 +965,15 @@ class StagedPipelineTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                call.args[0]["run_id"] == "test-run-id"
-                for call in _log_result.call_args_list
+                row["run_id"] == "test-run-id"
+                and row["result_key"]
+                for row in saved_rows
             )
+        )
+        update_progress.assert_called_once_with(
+            run_id="test-run-id",
+            questions_processed=4,
+            rows_saved=16,
         )
         save_statistics.assert_called_once()
         self.assertEqual(
@@ -765,7 +989,8 @@ class StagedPipelineTests(unittest.TestCase):
             run_id="test-run-id",
             questions_processed=4,
             rows_saved=16,
-            is_full_run=True,
+            is_full_run=False,
+            is_authoritative=True,
         )
 
     @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"})
@@ -775,12 +1000,12 @@ class StagedPipelineTests(unittest.TestCase):
             "source_experiment": "legacy_dev_experiment",
         }
 
-        with self.assertRaisesRegex(RuntimeError, "12-candidate dev shortlist"):
+        with self.assertRaisesRegex(RuntimeError, "dev shortlist sweep"):
             get_baseline_results()
 
     @patch("app.rag.pipeline.full_rag_parameter_sweep")
     @patch("app.rag.pipeline.get_retrieval_shortlist")
-    def test_dev_sweep_loads_exact_saved_twelve(
+    def test_dev_sweep_loads_exact_saved_three(
         self,
         get_shortlist,
         run_sweep,
@@ -799,7 +1024,7 @@ class StagedPipelineTests(unittest.TestCase):
         get_shortlist.return_value = {
             "source_experiment": "top_chunks_evidence_sweep",
             "source_split": "train",
-            "questions_run": 5735,
+            "questions_run": 300,
             "updated_at": "2026-07-30",
             "candidates": candidates,
         }
@@ -822,7 +1047,7 @@ class StagedPipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             summary["retrieval_shortlist_source"]["questions_run"],
-            5735,
+            300,
         )
 
     @patch("app.rag.pipeline.get_retrieval_shortlist", return_value=None)

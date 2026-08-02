@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import random
 from pathlib import Path
 import shutil
 import tempfile
@@ -16,6 +17,7 @@ DEV_SPLIT = "dev"
 TUNING_SPLIT = "train_dev"
 BASELINE_SPLIT = "test"
 FINQA_SPLITS = (TRAIN_SPLIT, DEV_SPLIT, BASELINE_SPLIT)
+DEFAULT_SAMPLE_SEED = 42
 FINQA_DATA_BASE_URL = (
     "https://raw.githubusercontent.com/czyssrs/FinQA/main/dataset"
 )
@@ -375,6 +377,86 @@ def iter_docfinqa_examples(
 
             yielded += 1
             yield convert_docfinqa_fields(raw_example, current_index)
+
+
+def iter_sampled_docfinqa_examples(
+    split: str = TUNING_SPLIT,
+    sample_size: int | None = None,
+    seed: int = DEFAULT_SAMPLE_SEED,
+) -> Iterator[dict]:
+    """Streams a reproducible uniform sample of questions from one split.
+
+    Reservoir sampling keeps memory proportional to ``sample_size`` and avoids
+    the ordering bias introduced by ``limit``. Returned examples retain their
+    original question IDs and are yielded in dataset order so downstream
+    processing remains deterministic.
+    """
+
+    if sample_size is None:
+        yield from iter_docfinqa_examples(split=split)
+        return
+
+    if isinstance(sample_size, bool) or not isinstance(sample_size, int):
+        raise TypeError("sample_size must be an integer or None.")
+    if sample_size < 0:
+        raise ValueError("sample_size must be non-negative.")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an integer.")
+    if sample_size == 0:
+        return
+
+    random_generator = random.Random(seed)
+    reservoir: list[tuple[int, dict]] = []
+    records_seen = 0
+
+    for records_seen, example in enumerate(
+        iter_docfinqa_examples(split=split),
+        start=1,
+    ):
+        dataset_index = records_seen - 1
+        if records_seen <= sample_size:
+            reservoir.append((dataset_index, example))
+            continue
+
+        replacement_index = random_generator.randrange(records_seen)
+        if replacement_index < sample_size:
+            reservoir[replacement_index] = (dataset_index, example)
+
+    if records_seen < sample_size:
+        raise ValueError(
+            f"sample_size {sample_size} exceeds the {records_seen} questions "
+            f"available in split '{split}'."
+        )
+
+    for _, example in sorted(reservoir, key=lambda item: item[0]):
+        yield example
+
+
+def iter_docfinqa_examples_by_question_ids(
+    split: str,
+    question_ids: list[str],
+) -> Iterator[dict]:
+    """Streams the exact persisted question manifest used by a resumed run."""
+
+    normalized_ids = [str(question_id) for question_id in question_ids]
+    if len(normalized_ids) != len(set(normalized_ids)):
+        raise ValueError("question_ids must be unique.")
+
+    requested_ids = set(normalized_ids)
+    found_ids: set[str] = set()
+    for example in iter_docfinqa_examples(split=split):
+        question_id = str(example["question_id"])
+        if question_id in requested_ids:
+            found_ids.add(question_id)
+            yield example
+
+    missing_ids = requested_ids - found_ids
+    if missing_ids:
+        missing_preview = ", ".join(sorted(missing_ids)[:5])
+        raise ValueError(
+            "Saved question IDs were not found in the current dataset: "
+            f"{missing_preview}"
+        )
 
 
 def iter_unique_documents() -> Iterator[dict]:

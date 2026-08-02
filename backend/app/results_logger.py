@@ -48,6 +48,7 @@ def create_results_table():
     CREATE TABLE IF NOT EXISTS rag_results (
         id SERIAL PRIMARY KEY,
         run_id TEXT,
+        result_key TEXT,
         experiment_name TEXT,
         dataset TEXT,
         split TEXT,
@@ -74,7 +75,8 @@ def create_results_table():
     ALTER TABLE rag_results
     ADD COLUMN IF NOT EXISTS split TEXT,
     ADD COLUMN IF NOT EXISTS reranker_pool_size INTEGER,
-    ADD COLUMN IF NOT EXISTS run_id TEXT;
+    ADD COLUMN IF NOT EXISTS run_id TEXT,
+    ADD COLUMN IF NOT EXISTS result_key TEXT;
     """
 
     experiment_runs_query = """
@@ -88,8 +90,11 @@ def create_results_table():
         is_full_run BOOLEAN NOT NULL DEFAULT FALSE,
         questions_processed INTEGER NOT NULL DEFAULT 0,
         rows_saved BIGINT NOT NULL DEFAULT 0,
+        expected_rows BIGINT,
+        is_authoritative BOOLEAN NOT NULL DEFAULT FALSE,
         parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
         started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_checkpoint_at TIMESTAMPTZ,
         completed_at TIMESTAMPTZ
     );
     """
@@ -164,20 +169,35 @@ def create_results_table():
 
     ALTER TABLE rag_statistical_analyses
     ADD COLUMN IF NOT EXISTS run_id TEXT;
+
+    ALTER TABLE rag_experiment_runs
+    ADD COLUMN IF NOT EXISTS expected_rows BIGINT,
+    ADD COLUMN IF NOT EXISTS is_authoritative BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS last_checkpoint_at TIMESTAMPTZ;
+
+    UPDATE rag_experiment_runs
+    SET is_authoritative = TRUE
+    WHERE is_full_run = TRUE
+      AND is_authoritative = FALSE
+      AND expected_rows IS NULL;
     """
 
     reporting_indexes_query = """
     CREATE INDEX IF NOT EXISTS rag_results_run_experiment_split_idx
     ON rag_results (run_id, experiment_name, split);
 
-    CREATE INDEX IF NOT EXISTS rag_experiment_runs_latest_completed_idx
+    CREATE UNIQUE INDEX IF NOT EXISTS rag_results_run_result_key_idx
+    ON rag_results (run_id, result_key);
+
+    CREATE INDEX IF NOT EXISTS
+        rag_experiment_runs_latest_authoritative_idx_v2
     ON rag_experiment_runs (
         experiment_name,
         split,
         model,
         completed_at DESC
     )
-    WHERE status = 'completed' AND is_full_run = TRUE;
+    WHERE status = 'completed' AND is_authoritative = TRUE;
     """
 
     with _SCHEMA_LOCK:
@@ -206,6 +226,7 @@ def start_experiment_run(
     split: str,
     model: str | None = None,
     parameters: dict[str, Any] | None = None,
+    expected_rows: int | None = None,
 ) -> str:
     """Creates one run record before result rows are written."""
 
@@ -219,7 +240,8 @@ def start_experiment_run(
         split,
         model,
         status,
-        parameters
+        parameters,
+        expected_rows
     )
     VALUES (
         %(run_id)s,
@@ -228,7 +250,8 @@ def start_experiment_run(
         %(split)s,
         %(model)s,
         'running',
-        %(parameters)s
+        %(parameters)s,
+        %(expected_rows)s
     );
     """
     params = {
@@ -238,13 +261,152 @@ def start_experiment_run(
         "split": split,
         "model": model,
         "parameters": Json(parameters or {}),
+        "expected_rows": expected_rows,
     }
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(query, params)
 
+    print(
+        f"Started {experiment_name} run_id={run_id}; save this ID to resume.",
+        flush=True,
+    )
     return run_id
+
+
+def get_experiment_run(run_id: str) -> dict[str, Any] | None:
+    """Returns one run manifest together with its durable result-row count."""
+
+    create_results_table()
+    query = """
+    SELECT
+        run.*,
+        COUNT(result.id)::bigint AS actual_rows_saved
+    FROM rag_experiment_runs AS run
+    LEFT JOIN rag_results AS result
+      ON result.run_id = run.run_id
+    WHERE run.run_id = %s
+    GROUP BY run.run_id;
+    """
+    with get_connection() as connection:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(query, (run_id,))
+            row = cursor.fetchone()
+    return _json_compatible(row) if row is not None else None
+
+
+def resume_experiment_run(
+    *,
+    run_id: str,
+    experiment_name: str,
+    dataset: str,
+    split: str,
+    model: str | None,
+    parameters: dict[str, Any],
+    expected_rows: int,
+) -> dict[str, Any]:
+    """Validates and returns an interrupted run before it is resumed."""
+
+    run = get_experiment_run(run_id)
+    if run is None:
+        raise ValueError(f"Experiment run '{run_id}' was not found.")
+    if run["status"] != "running":
+        raise ValueError(
+            f"Experiment run '{run_id}' is already {run['status']}."
+        )
+
+    expected_manifest = {
+        "experiment_name": experiment_name,
+        "dataset": dataset,
+        "split": split,
+        "model": model,
+        "parameters": _json_compatible(parameters),
+        "expected_rows": expected_rows,
+    }
+    actual_manifest = {
+        "experiment_name": run["experiment_name"],
+        "dataset": run["dataset"],
+        "split": run["split"],
+        "model": run["model"],
+        "parameters": run["parameters"],
+        "expected_rows": run["expected_rows"],
+    }
+    if actual_manifest != expected_manifest:
+        raise ValueError(
+            "The requested protocol does not match the saved checkpoint "
+            f"for run '{run_id}'."
+        )
+    return run
+
+
+def update_experiment_run_progress(
+    *,
+    run_id: str,
+    questions_processed: int,
+    rows_saved: int,
+) -> None:
+    """Updates durable progress after a result batch is committed."""
+
+    if questions_processed < 0 or rows_saved < 0:
+        raise ValueError("Checkpoint counters cannot be negative.")
+
+    create_results_table()
+    query = """
+    UPDATE rag_experiment_runs
+    SET
+        questions_processed = GREATEST(
+            questions_processed,
+            %(questions_processed)s
+        ),
+        rows_saved = GREATEST(rows_saved, %(rows_saved)s),
+        last_checkpoint_at = CURRENT_TIMESTAMP
+    WHERE run_id = %(run_id)s
+      AND status = 'running';
+    """
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {
+                    "run_id": run_id,
+                    "questions_processed": questions_processed,
+                    "rows_saved": rows_saved,
+                },
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Experiment run '{run_id}' was not in the running state."
+                )
+
+
+def get_run_results_for_resume(run_id: str) -> list[dict[str, Any]]:
+    """Loads compact saved outcomes used to rebuild rankings and checkpoints."""
+
+    create_results_table()
+    query = """
+    SELECT
+        id,
+        result_key,
+        question_id,
+        is_correct,
+        retrieval_method,
+        chunk_strategy,
+        chunk_size,
+        top_k,
+        reranker_used,
+        reranker_pool_size,
+        retrieval_metrics,
+        generation_metrics
+    FROM rag_results
+    WHERE run_id = %s
+    ORDER BY id;
+    """
+    with get_connection() as connection:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(query, (run_id,))
+            rows = cursor.fetchall()
+    return _json_compatible(rows)
 
 
 def complete_experiment_run(
@@ -253,8 +415,16 @@ def complete_experiment_run(
     questions_processed: int,
     rows_saved: int,
     is_full_run: bool,
+    is_authoritative: bool | None = None,
 ) -> None:
     """Marks a normally finished run complete for final-results reporting."""
+
+    if questions_processed < 0 or rows_saved < 0:
+        raise ValueError("Completion counters cannot be negative.")
+
+    authoritative = (
+        is_full_run if is_authoritative is None else is_authoritative
+    )
 
     create_results_table()
     query = """
@@ -262,8 +432,10 @@ def complete_experiment_run(
     SET
         status = 'completed',
         is_full_run = %(is_full_run)s,
+        is_authoritative = %(is_authoritative)s,
         questions_processed = %(questions_processed)s,
         rows_saved = %(rows_saved)s,
+        last_checkpoint_at = CURRENT_TIMESTAMP,
         completed_at = CURRENT_TIMESTAMP
     WHERE run_id = %(run_id)s
       AND status = 'running';
@@ -273,10 +445,47 @@ def complete_experiment_run(
         "questions_processed": questions_processed,
         "rows_saved": rows_saved,
         "is_full_run": is_full_run,
+        "is_authoritative": authoritative,
     }
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    run.expected_rows,
+                    COUNT(result.id)::bigint,
+                    COUNT(DISTINCT result.result_key)::bigint
+                FROM rag_experiment_runs AS run
+                LEFT JOIN rag_results AS result
+                  ON result.run_id = run.run_id
+                WHERE run.run_id = %s
+                  AND run.status = 'running'
+                GROUP BY run.run_id;
+                """,
+                (run_id,),
+            )
+            counts = cursor.fetchone()
+            if counts is None:
+                raise RuntimeError(
+                    f"Experiment run '{run_id}' was not in the running state."
+                )
+            expected_rows, actual_rows, distinct_result_keys = counts
+            if actual_rows != rows_saved:
+                raise RuntimeError(
+                    f"Run '{run_id}' has {actual_rows} durable rows, not the "
+                    f"reported {rows_saved}."
+                )
+            if authoritative and (
+                expected_rows is None
+                or actual_rows != expected_rows
+                or distinct_result_keys != expected_rows
+            ):
+                raise RuntimeError(
+                    f"Run '{run_id}' cannot be authoritative: expected "
+                    f"{expected_rows} unique rows and found {actual_rows} "
+                    f"rows with {distinct_result_keys} result keys."
+                )
             cursor.execute(query, params)
             if cursor.rowcount != 1:
                 raise RuntimeError(
@@ -356,7 +565,7 @@ def get_retrieval_shortlist(
     JOIN rag_experiment_runs AS run
       ON run.run_id = shortlist.run_id
      AND run.status = 'completed'
-     AND run.is_full_run = TRUE
+     AND run.is_authoritative = TRUE
     WHERE shortlist.dataset = %s
       AND shortlist.source_experiment = %s
       AND shortlist.source_split = %s;
@@ -447,12 +656,12 @@ def get_latest_completed_runs(
     model: str | None = None,
     ensure_table: bool = True,
 ):
-    """Returns the newest completed full run per experiment, split, and model."""
+    """Returns the newest completed authoritative run per experiment."""
 
     if ensure_table:
         create_results_table()
 
-    filters = ["status = 'completed'", "is_full_run = TRUE"]
+    filters = ["status = 'completed'", "is_authoritative = TRUE"]
     params = []
     if split is not None:
         filters.append("split = %s")
@@ -475,10 +684,13 @@ def get_latest_completed_runs(
         model,
         status,
         is_full_run,
+        is_authoritative,
         questions_processed,
         rows_saved,
+        expected_rows,
         parameters,
         started_at,
+        last_checkpoint_at,
         completed_at
     FROM rag_experiment_runs
     WHERE {' AND '.join(filters)}
@@ -530,10 +742,13 @@ def get_latest_completed_math_agent_run(
         model,
         status,
         is_full_run,
+        is_authoritative,
         questions_processed,
         rows_saved,
+        expected_rows,
         parameters,
         started_at,
+        last_checkpoint_at,
         completed_at
     FROM rag_experiment_runs
     WHERE {' AND '.join(filters)}
@@ -576,7 +791,7 @@ def get_statistical_analyses(
     JOIN rag_experiment_runs AS run
       ON run.run_id = statistical.run_id
      AND run.status = 'completed'
-     AND run.is_full_run = TRUE
+     AND run.is_authoritative = TRUE
     WHERE statistical.run_id = ANY(%s)
     ORDER BY
         statistical.source_split,
@@ -685,7 +900,7 @@ def get_best_rag_parameters(dataset: str, model: str, source_split: str):
     JOIN rag_experiment_runs AS run
       ON run.run_id = parameters.run_id
      AND run.status = 'completed'
-     AND run.is_full_run = TRUE
+     AND run.is_authoritative = TRUE
     WHERE parameters.dataset = %s
       AND parameters.model = %s
       AND parameters.source_split = %s;
@@ -729,7 +944,7 @@ def get_retrieval_shortlists(
     JOIN rag_experiment_runs AS run
       ON run.run_id = shortlist.run_id
      AND run.status = 'completed'
-     AND run.is_full_run = TRUE
+     AND run.is_authoritative = TRUE
     WHERE shortlist.run_id = ANY(%s)
     ORDER BY shortlist.source_split, shortlist.updated_at DESC;
     """
@@ -770,7 +985,7 @@ def get_best_rag_parameter_rows(
     JOIN rag_experiment_runs AS run
       ON run.run_id = parameters.run_id
      AND run.status = 'completed'
-     AND run.is_full_run = TRUE
+     AND run.is_authoritative = TRUE
     WHERE parameters.run_id = ANY(%s)
     ORDER BY parameters.source_split, parameters.model, parameters.updated_at DESC;
     """
@@ -788,10 +1003,13 @@ def log_question_result(result: dict[str, Any]) -> int:
     """
 
     create_results_table()
+    if result.get("run_id") and not result.get("result_key"):
+        raise ValueError("A run-scoped result requires result_key.")
 
     query = """
     INSERT INTO rag_results (
         run_id,
+        result_key,
         experiment_name,
         dataset,
         split,
@@ -813,6 +1031,7 @@ def log_question_result(result: dict[str, Any]) -> int:
     )
     VALUES (
         %(run_id)s,
+        %(result_key)s,
         %(experiment_name)s,
         %(dataset)s,
         %(split)s,
@@ -832,11 +1051,14 @@ def log_question_result(result: dict[str, Any]) -> int:
         %(retrieval_metrics)s,
         %(generation_metrics)s
     )
+    ON CONFLICT (run_id, result_key)
+    DO UPDATE SET result_key = EXCLUDED.result_key
     RETURNING id;
     """
 
     params = {
         "run_id": result.get("run_id"),
+        "result_key": result.get("result_key"),
         "experiment_name": result.get("experiment_name"),
         "dataset": result.get("dataset"),
         "split": result.get("split"),
@@ -874,12 +1096,17 @@ def log_question_results(
     if not results:
         return []
 
+    for result in results:
+        if result.get("run_id") and not result.get("result_key"):
+            raise ValueError("Every run-scoped result requires result_key.")
+
     if ensure_table:
         create_results_table()
 
     query = """
     INSERT INTO rag_results (
         run_id,
+        result_key,
         experiment_name,
         dataset,
         split,
@@ -900,12 +1127,15 @@ def log_question_results(
         generation_metrics
     )
     VALUES %s
+    ON CONFLICT (run_id, result_key)
+    DO UPDATE SET result_key = EXCLUDED.result_key
     RETURNING id;
     """
 
     values = [
         (
             result.get("run_id"),
+            result.get("result_key"),
             result.get("experiment_name"),
             result.get("dataset"),
             result.get("split"),
@@ -1042,7 +1272,7 @@ def get_parameter_summary(
     full_run_filter = (
         ""
         if include_partial_runs
-        else "AND run.is_full_run = TRUE"
+        else "AND run.is_authoritative = TRUE"
     )
 
     if experiment_name == "top_chunks_evidence_sweep":
@@ -1224,7 +1454,7 @@ def get_final_result_tables(
     split: str | None = None,
     model: str | None = None,
 ):
-    """Returns authoritative summaries from the latest completed full runs."""
+    """Returns summaries from the latest completed authoritative runs."""
 
     create_results_table()
     selected_runs = get_latest_completed_runs(
@@ -1241,14 +1471,15 @@ def get_final_result_tables(
     exploratory_math_agent = None
     if (
         latest_math_agent_run is not None
-        and not latest_math_agent_run["is_full_run"]
+        and not latest_math_agent_run.get("is_authoritative", False)
     ):
         exploratory_math_agent = {
-            "reporting_role": "exploratory_partial_run",
+            "reporting_role": "exploratory_incomplete_or_custom_run",
             "authoritative": False,
             "warning": (
-                "This run did not cover the full requested dataset and must "
-                "not be reported as a final full-dataset result."
+                "This run did not complete the predeclared 100-question "
+                "math protocol and must not be reported as the final math "
+                "experiment."
             ),
             "run": latest_math_agent_run,
             "summary": get_parameter_summary(

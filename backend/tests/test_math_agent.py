@@ -1,5 +1,6 @@
 import json
 import inspect
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -264,6 +265,57 @@ class MathAgentGenerationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "insufficient_context")
         self.assertIsNone(result["answer"])
+
+    @patch("app.rag.math_agent.generate_math_program")
+    def test_openai_api_failure_is_raised_for_checkpoint_resume(
+        self,
+        generate_program,
+    ):
+        class FakeAPIError(Exception):
+            pass
+
+        generate_program.side_effect = FakeAPIError("rate limited")
+        fake_openai = SimpleNamespace(APIError=FakeAPIError)
+        with patch.dict(sys.modules, {"openai": fake_openai}):
+            with self.assertRaises(FakeAPIError):
+                math_agent(
+                    question="What was the increase?",
+                    chunks=self.chunks,
+                    client=object(),
+                )
+
+    @patch(
+        "app.rag.math_agent.limit_chunks_to_prompt_budget",
+        side_effect=lambda question, retrieved_chunks, model, prompt_builder: (
+            retrieved_chunks
+        ),
+    )
+    @patch("app.rag.math_agent.get_openai_client")
+    def test_uses_shared_openai_client_when_client_is_not_supplied(
+        self,
+        get_client,
+        _limit_chunks,
+    ):
+        predicted_program = _program(
+            [
+                {
+                    "operation": "identity",
+                    "arguments": ["125"],
+                    "source_ids": [1],
+                }
+            ]
+        )
+        get_client.return_value = FakeClient(json.dumps(predicted_program))
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            result = math_agent(
+                question="What was the revenue in 2023?",
+                chunks=self.chunks,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["answer"], "125")
+        get_client.assert_called_once_with()
 
     @patch(
         "app.rag.math_agent.limit_chunks_to_prompt_budget",

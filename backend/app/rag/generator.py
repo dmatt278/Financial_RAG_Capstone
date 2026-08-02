@@ -1,11 +1,55 @@
 import os
+from functools import lru_cache
+from threading import Lock
 from typing import Any, Callable
 
 
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_MAX_RETRIES = 2
 GPT4_CONTEXT_WINDOW_TOKENS = 8192
 MAX_GENERATION_TOKENS = 512
 MAX_PROMPT_TOKENS = GPT4_CONTEXT_WINDOW_TOKENS - MAX_GENERATION_TOKENS
+_OPENAI_CLIENT_LOCK = Lock()
+
+
+def get_openai_max_retries() -> int:
+    """Returns the retry count delegated to the OpenAI Python SDK."""
+
+    raw_value = os.getenv(
+        "OPENAI_MAX_RETRIES",
+        str(DEFAULT_OPENAI_MAX_RETRIES),
+    )
+    try:
+        max_retries = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "OPENAI_MAX_RETRIES must be a non-negative integer."
+        ) from exc
+
+    if max_retries < 0:
+        raise RuntimeError(
+            "OPENAI_MAX_RETRIES must be a non-negative integer."
+        )
+    return max_retries
+
+
+@lru_cache(maxsize=1)
+def _get_openai_client():
+    """Creates one reusable OpenAI client with SDK-managed retries."""
+
+    from openai import OpenAI
+
+    return OpenAI(max_retries=get_openai_max_retries())
+
+
+def get_openai_client():
+    """Returns the process-wide client without racing on first use."""
+
+    with _OPENAI_CLIENT_LOCK:
+        return _get_openai_client()
+
+
+get_openai_client.cache_clear = _get_openai_client.cache_clear
 
 
 def _get_tokenizer(model: str):
@@ -252,9 +296,7 @@ def generate_no_context_answer(question: str) -> str:
             "OPENAI_API_KEY is required to generate a no-context answer."
         )
 
-    from openai import OpenAI
-
-    client = OpenAI()
+    client = get_openai_client()
     model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
     response = client.chat.completions.create(
         model=model,
@@ -285,9 +327,7 @@ def generate_answer(
     if not os.getenv("OPENAI_API_KEY"):
         return "OpenAI API key is not configured. Set OPENAI_API_KEY to generate an answer."
 
-    from openai import OpenAI
-
-    client = OpenAI()
+    client = get_openai_client()
     model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
     limited_chunks = limit_chunks_to_prompt_budget(
         question=question,

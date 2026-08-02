@@ -2,7 +2,8 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -10,10 +11,12 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 
+from app.rag import generator  # noqa: E402
 from app.rag.generator import (  # noqa: E402
     _generation_context_metrics,
     build_no_context_answer_prompt,
     generate_no_context_answer,
+    get_openai_max_retries,
     limit_chunks_to_prompt_budget,
 )
 
@@ -34,6 +37,42 @@ class NoContextGeneratorTests(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
             with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
                 generate_no_context_answer("What was the revenue?")
+
+
+class OpenAIClientTests(unittest.TestCase):
+    def tearDown(self):
+        generator.get_openai_client.cache_clear()
+
+    def test_client_is_reused_with_explicit_sdk_retry_configuration(self):
+        client = object()
+        constructor = Mock(return_value=client)
+        fake_openai = SimpleNamespace(OpenAI=constructor)
+
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_MAX_RETRIES": "4",
+            },
+        ), patch.dict(sys.modules, {"openai": fake_openai}):
+            first = generator.get_openai_client()
+            second = generator.get_openai_client()
+
+        self.assertIs(first, client)
+        self.assertIs(second, client)
+        constructor.assert_called_once_with(max_retries=4)
+
+    def test_retry_count_must_be_a_non_negative_integer(self):
+        for invalid_value in ("not-an-integer", "-1"):
+            with self.subTest(invalid_value=invalid_value), patch.dict(
+                os.environ,
+                {"OPENAI_MAX_RETRIES": invalid_value},
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "OPENAI_MAX_RETRIES",
+                ):
+                    get_openai_max_retries()
 
 
 class _CharacterTokenizer:

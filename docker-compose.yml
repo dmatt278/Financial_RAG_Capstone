@@ -14,6 +14,8 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/financial_rag
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - OPENAI_CONCURRENCY=${OPENAI_CONCURRENCY:-4}
+      - OPENAI_MAX_RETRIES=${OPENAI_MAX_RETRIES:-2}
       - DOCFINQA_DATA_DIR=/app/data/docfinqa
       - FINQA_DATA_DIR=/app/data/finqa
       - CHROMA_PERSIST_DIR=/app/data/chroma

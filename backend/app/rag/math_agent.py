@@ -8,6 +8,7 @@ from app.rag.generator import (
     DEFAULT_OPENAI_MODEL,
     MAX_GENERATION_TOKENS,
     format_context,
+    get_openai_client,
     limit_chunks_to_prompt_budget,
 )
 
@@ -535,9 +536,7 @@ def generate_math_program(
             raise RuntimeError(
                 "OPENAI_API_KEY is required to generate a mathematical program."
             )
-        from openai import OpenAI
-
-        client = OpenAI()
+        client = get_openai_client()
 
     response = client.chat.completions.create(
         model=model,
@@ -704,6 +703,12 @@ def math_agent(
             }
         )
     except Exception as exc:
+        try:
+            from openai import APIError
+        except ImportError:
+            APIError = ()
+        if isinstance(exc, APIError):
+            raise
         result["error"] = str(exc)
         return result
 

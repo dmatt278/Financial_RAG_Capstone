@@ -1,16 +1,39 @@
-from fastapi import FastAPI
+from threading import Lock
+from fastapi import FastAPI, HTTPException
 from typing import Literal
-from app.data.data_loader import TRAIN_SPLIT, TUNING_SPLIT, prepare_finqa_files
+from app.data.data_loader import (
+    DEFAULT_SAMPLE_SEED,
+    TRAIN_SPLIT,
+    TUNING_SPLIT,
+    prepare_finqa_files,
+)
 from app.rag.pipeline import (
+    DEV_SAMPLE_SIZE,
+    MATH_SAMPLE_SIZE,
+    TEST_SAMPLE_SIZE,
+    TRAIN_SAMPLE_SIZE,
     full_rag_shortlist_sweep,
     full_rag_with_math_agent,
     get_baseline_results,
     top_chunks,
 )
 from app.rag.vector_store import insert_docfinqa_chunk_sweep
-from app.results_logger import get_final_result_tables
+from app.results_logger import get_experiment_run, get_final_result_tables
 
 app = FastAPI(title='Financial RAG Capstone API')
+_LONG_EXPERIMENT_LOCK = Lock()
+
+
+def _run_long_experiment(callback):
+    if not _LONG_EXPERIMENT_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Another long-running experiment is already active.",
+        )
+    try:
+        return callback()
+    finally:
+        _LONG_EXPERIMENT_LOCK.release()
 
 #checks that the API is running
 @app.get("/")
@@ -44,10 +67,12 @@ def load_docfinqa(
     Loads and chunks all unique DocFinQA documents into Chroma for vector retrieval.
     """
 
-    return insert_docfinqa_chunk_sweep(
-        start_index=start_index,
-        limit=limit,
-        reset=reset,
+    return _run_long_experiment(
+        lambda: insert_docfinqa_chunk_sweep(
+            start_index=start_index,
+            limit=limit,
+            reset=reset,
+        )
     )
 
 @app.post("/load-finqa")
@@ -56,7 +81,7 @@ def load_finqa():
     Downloads the original FinQA splits used for gold supporting evidence.
     """
 
-    return prepare_finqa_files()
+    return _run_long_experiment(prepare_finqa_files)
 
 
 @app.post("/run-chunk-rag")
@@ -66,18 +91,26 @@ def chunk_rag(
     chunk_size: int | None = None,
     log_results: bool = True,
     return_results: bool = False,
+    sample_size: int | None = TRAIN_SAMPLE_SIZE,
+    sample_seed: int = DEFAULT_SAMPLE_SEED,
+    resume_run_id: str | None = None,
 ):
     """
-    Runs all 324 retrieval configurations on train and saves the top 12.
+    Runs all 324 configurations on 300 seeded train questions and saves 3.
     """
 
-    return top_chunks(
-        split=TRAIN_SPLIT,
-        start_index=start_index,
-        limit=limit,
-        chunk_size=chunk_size,
-        log_results=log_results,
-        return_results=return_results,
+    return _run_long_experiment(
+        lambda: top_chunks(
+            split=TRAIN_SPLIT,
+            start_index=start_index,
+            limit=limit,
+            chunk_size=chunk_size,
+            log_results=log_results,
+            return_results=return_results,
+            sample_size=sample_size,
+            sample_seed=sample_seed,
+            resume_run_id=resume_run_id,
+        )
     )
 
 
@@ -87,62 +120,91 @@ def full_rag_pipeline(
     limit: int | None = None,
     log_results: bool = True,
     return_results: bool = False,
+    sample_size: int | None = DEV_SAMPLE_SIZE,
+    sample_seed: int = DEFAULT_SAMPLE_SEED,
+    resume_run_id: str | None = None,
 ):
     """
-    Runs the saved 12 train retrieval finalists on dev, saves the winner, and
+    Runs the saved 3 train retrieval finalists on 500 dev questions and
     stores exploratory paired statistical diagnostics.
     """
 
-    return full_rag_shortlist_sweep(
-        start_index=start_index,
-        limit=limit,
-        log_results=log_results,
-        return_results=return_results,
+    return _run_long_experiment(
+        lambda: full_rag_shortlist_sweep(
+            start_index=start_index,
+            limit=limit,
+            log_results=log_results,
+            return_results=return_results,
+            sample_size=sample_size,
+            sample_seed=sample_seed,
+            resume_run_id=resume_run_id,
+        )
     )
 
 
 @app.post("/run-full-rag-math-agent")
 def full_rag_math_agent_pipeline(
     start_index: int = 0,
-    limit: int = 15,
-    full_dataset: bool = False,
-    top_k: int | None = None,
-    strategy: Literal["fixed", "sentence", "section"] | None = None,
+    limit: int | None = None,
+    top_k: int = 5,
+    strategy: Literal["fixed", "sentence", "section"] = "section",
     chunk_size: int = 512,
-    retrieval_method: Literal["keyword", "semantic", "hybrid"] | None = None,
+    retrieval_method: Literal["keyword", "semantic", "hybrid"] = "hybrid",
     log_results: bool = True,
     return_results: bool = False,
+    sample_seed: int = DEFAULT_SAMPLE_SEED,
+    resume_run_id: str | None = None,
 ):
     """
     Separately compares direct LLM math with LLM-planned calculations executed
-    by the deterministic DocFinQA math tool. Set full_dataset=true explicitly
-    to run beyond the default 15-question diagnostic.
+    by the deterministic DocFinQA math tool on 100 seeded questions.
     """
 
-    return full_rag_with_math_agent(
-        split=TUNING_SPLIT,
-        start_index=start_index,
-        limit=None if full_dataset else limit,
-        top_k_values=[top_k] if top_k is not None else None,
-        strategies=[strategy] if strategy is not None else None,
-        retrieval_methods=(
-            [retrieval_method]
-            if retrieval_method is not None
-            else None
-        ),
-        chunk_size=chunk_size,
-        log_results=log_results,
-        return_results=return_results,
+    return _run_long_experiment(
+        lambda: full_rag_with_math_agent(
+            split=TUNING_SPLIT,
+            start_index=start_index,
+            limit=limit,
+            top_k_values=[top_k],
+            strategies=[strategy],
+            retrieval_methods=[retrieval_method],
+            chunk_size=chunk_size,
+            log_results=log_results,
+            return_results=return_results,
+            sample_size=MATH_SAMPLE_SIZE,
+            sample_seed=sample_seed,
+            resume_run_id=resume_run_id,
+        )
     )
     
 
 @app.post("/get-baselines")
-def get_baselines():
+def get_baselines(
+    sample_size: int | None = TEST_SAMPLE_SIZE,
+    sample_seed: int = DEFAULT_SAMPLE_SEED,
+    resume_run_id: str | None = None,
+):
     """
     Runs the test baselines against the frozen optimized pipeline and stores
     confirmatory paired statistical comparisons.
     """
-    return get_baseline_results()
+    return _run_long_experiment(
+        lambda: get_baseline_results(
+            sample_size=sample_size,
+            sample_seed=sample_seed,
+            resume_run_id=resume_run_id,
+        )
+    )
+
+
+@app.get("/experiment-status/{run_id}")
+def experiment_status(run_id: str):
+    """Returns durable checkpoint progress for one experiment run."""
+
+    run = get_experiment_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Experiment run not found.")
+    return run
 
 
 @app.get("/final-results")

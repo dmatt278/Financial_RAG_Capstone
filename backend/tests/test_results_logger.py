@@ -202,7 +202,7 @@ class ResultsLoggerTests(unittest.TestCase):
             [{"experiment_name": "top_chunks_evidence_sweep"}],
         )
 
-    def test_latest_runs_query_requires_completed_full_runs_and_filters_model(self):
+    def test_latest_runs_query_requires_completed_authoritative_runs_and_filters_model(self):
         cursor = _FakeCursor(
             rows=[
                 {
@@ -226,7 +226,7 @@ class ResultsLoggerTests(unittest.TestCase):
         query, params = cursor.executions[0]
         normalized_query = " ".join(query.split())
         self.assertIn("status = 'completed'", normalized_query)
-        self.assertIn("is_full_run = TRUE", normalized_query)
+        self.assertIn("is_authoritative = TRUE", normalized_query)
         self.assertIn("split = %s", normalized_query)
         self.assertIn("(model = %s OR model IS NULL)", normalized_query)
         self.assertIn("SELECT DISTINCT ON", normalized_query)
@@ -265,7 +265,7 @@ class ResultsLoggerTests(unittest.TestCase):
         self.assertIn("result.run_id", normalized_query)
         self.assertIn("run.model", normalized_query)
         self.assertIn("comparison_method", normalized_query)
-        self.assertIn("run.is_full_run = TRUE", normalized_query)
+        self.assertIn("run.is_authoritative = TRUE", normalized_query)
         self.assertIn("result.run_id = ANY(%s)", normalized_query)
         self.assertIn("0.50 * COALESCE", normalized_query)
         self.assertIn("0.30 * COALESCE", normalized_query)
@@ -291,6 +291,7 @@ class ResultsLoggerTests(unittest.TestCase):
                 "experiment_name": "full_rag_math_tool_agent",
                 "status": "completed",
                 "is_full_run": False,
+                "is_authoritative": False,
             }
         )
         connection = _FakeConnection(cursor)
@@ -310,7 +311,7 @@ class ResultsLoggerTests(unittest.TestCase):
         normalized_query = " ".join(query.split())
         self.assertIn("status = 'completed'", normalized_query)
         self.assertIn("experiment_name = %s", normalized_query)
-        self.assertNotIn("is_full_run = TRUE", normalized_query)
+        self.assertNotIn("is_authoritative = TRUE", normalized_query)
         self.assertEqual(
             params,
             (
@@ -342,7 +343,7 @@ class ResultsLoggerTests(unittest.TestCase):
         query, params = cursor.executions[0]
         normalized_query = " ".join(query.split())
         self.assertIn("run.status = 'completed'", normalized_query)
-        self.assertNotIn("run.is_full_run = TRUE", normalized_query)
+        self.assertNotIn("run.is_authoritative = TRUE", normalized_query)
         self.assertIn("result.run_id = ANY(%s)", normalized_query)
         self.assertEqual(
             params,
@@ -357,6 +358,7 @@ class ResultsLoggerTests(unittest.TestCase):
             "model": "gpt-4o-mini",
             "status": "completed",
             "is_full_run": False,
+            "is_authoritative": False,
         }
 
         with ExitStack() as stack:
@@ -442,12 +444,216 @@ class ResultsLoggerTests(unittest.TestCase):
         self.assertIn("run_id TEXT", normalized_schema_sql)
         self.assertIn("status TEXT NOT NULL", normalized_schema_sql)
         self.assertIn("is_full_run BOOLEAN NOT NULL", normalized_schema_sql)
+        self.assertIn("is_authoritative BOOLEAN NOT NULL", normalized_schema_sql)
+        self.assertIn("expected_rows BIGINT", normalized_schema_sql)
+        self.assertIn("last_checkpoint_at TIMESTAMPTZ", normalized_schema_sql)
+        self.assertIn("result_key TEXT", normalized_schema_sql)
         self.assertIn("ALTER TABLE rag_best_parameters ADD COLUMN IF NOT EXISTS run_id TEXT", normalized_schema_sql)
         self.assertIn("ALTER TABLE rag_retrieval_shortlists ADD COLUMN IF NOT EXISTS run_id TEXT", normalized_schema_sql)
         self.assertIn("ALTER TABLE rag_statistical_analyses ADD COLUMN IF NOT EXISTS run_id TEXT", normalized_schema_sql)
         self.assertIn("rag_results_run_experiment_split_idx", normalized_schema_sql)
-        self.assertIn("rag_experiment_runs_latest_completed_idx", normalized_schema_sql)
-        self.assertIn("WHERE status = 'completed' AND is_full_run = TRUE", normalized_schema_sql)
+        self.assertIn("rag_results_run_result_key_idx", normalized_schema_sql)
+        self.assertIn("ON rag_results (run_id, result_key)", normalized_schema_sql)
+        self.assertIn("rag_experiment_runs_latest_authoritative_idx_v2", normalized_schema_sql)
+        self.assertIn("WHERE status = 'completed' AND is_authoritative = TRUE", normalized_schema_sql)
+
+    def test_resume_validates_the_exact_saved_manifest_and_running_status(self):
+        saved_run = {
+            "run_id": "run-123",
+            "experiment_name": "full_rag_dev_shortlist_sweep",
+            "dataset": "docfinqa",
+            "split": "dev",
+            "model": "gpt-4o-mini",
+            "status": "running",
+            "parameters": {
+                "sample_size": 500,
+                "sample_seed": 42,
+                "question_ids": ["2", "7"],
+            },
+            "expected_rows": 1500,
+        }
+        requested = {
+            "run_id": "run-123",
+            "experiment_name": "full_rag_dev_shortlist_sweep",
+            "dataset": "docfinqa",
+            "split": "dev",
+            "model": "gpt-4o-mini",
+            "parameters": saved_run["parameters"],
+            "expected_rows": 1500,
+        }
+
+        with patch.object(
+            results_logger,
+            "get_experiment_run",
+            return_value=saved_run,
+        ):
+            resumed = results_logger.resume_experiment_run(**requested)
+
+        self.assertEqual(resumed, saved_run)
+
+        mismatched = dict(requested)
+        mismatched["parameters"] = {
+            **saved_run["parameters"],
+            "sample_seed": 43,
+        }
+        with patch.object(
+            results_logger,
+            "get_experiment_run",
+            return_value=saved_run,
+        ):
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                results_logger.resume_experiment_run(**mismatched)
+
+        completed_run = {**saved_run, "status": "completed"}
+        with patch.object(
+            results_logger,
+            "get_experiment_run",
+            return_value=completed_run,
+        ):
+            with self.assertRaisesRegex(ValueError, "already completed"):
+                results_logger.resume_experiment_run(**requested)
+
+    def test_checkpoint_progress_updates_only_a_running_run(self):
+        cursor = _FakeCursor(rowcount=1)
+        connection = _FakeConnection(cursor)
+
+        with (
+            patch.object(results_logger, "create_results_table"),
+            patch.object(
+                results_logger,
+                "get_connection",
+                return_value=connection,
+            ),
+        ):
+            results_logger.update_experiment_run_progress(
+                run_id="run-123",
+                questions_processed=125,
+                rows_saved=375,
+            )
+
+        query, params = cursor.executions[0]
+        normalized_query = " ".join(query.split())
+        self.assertIn("last_checkpoint_at = CURRENT_TIMESTAMP", normalized_query)
+        self.assertIn("status = 'running'", normalized_query)
+        self.assertEqual(
+            params,
+            {
+                "run_id": "run-123",
+                "questions_processed": 125,
+                "rows_saved": 375,
+            },
+        )
+
+        cursor = _FakeCursor(rowcount=0)
+        connection = _FakeConnection(cursor)
+        with (
+            patch.object(results_logger, "create_results_table"),
+            patch.object(
+                results_logger,
+                "get_connection",
+                return_value=connection,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "running state"):
+                results_logger.update_experiment_run_progress(
+                    run_id="completed-run",
+                    questions_processed=125,
+                    rows_saved=375,
+                )
+
+    def test_authoritative_completion_verifies_durable_and_unique_row_counts(self):
+        cursor = _FakeCursor(row=(1500, 1500, 1500), rowcount=1)
+        connection = _FakeConnection(cursor)
+
+        with (
+            patch.object(results_logger, "create_results_table"),
+            patch.object(
+                results_logger,
+                "get_connection",
+                return_value=connection,
+            ),
+        ):
+            results_logger.complete_experiment_run(
+                run_id="run-123",
+                questions_processed=500,
+                rows_saved=1500,
+                is_full_run=False,
+                is_authoritative=True,
+            )
+
+        self.assertEqual(len(cursor.executions), 2)
+        count_query, count_params = cursor.executions[0]
+        completion_query, completion_params = cursor.executions[1]
+        normalized_count_query = " ".join(count_query.split())
+        normalized_completion_query = " ".join(completion_query.split())
+        self.assertIn("COUNT(DISTINCT result.result_key)", normalized_count_query)
+        self.assertIn("result.run_id = run.run_id", normalized_count_query)
+        self.assertEqual(count_params, ("run-123",))
+        self.assertIn("is_authoritative = %(is_authoritative)s", normalized_completion_query)
+        self.assertTrue(completion_params["is_authoritative"])
+        self.assertFalse(completion_params["is_full_run"])
+
+        invalid_counts = (
+            ((1500, 1499, 1499), "durable rows"),
+            ((1500, 1500, 1499), "cannot be authoritative"),
+        )
+        for counts, message in invalid_counts:
+            with self.subTest(counts=counts):
+                invalid_cursor = _FakeCursor(row=counts, rowcount=1)
+                invalid_connection = _FakeConnection(invalid_cursor)
+                with (
+                    patch.object(results_logger, "create_results_table"),
+                    patch.object(
+                        results_logger,
+                        "get_connection",
+                        return_value=invalid_connection,
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        results_logger.complete_experiment_run(
+                            run_id="run-123",
+                            questions_processed=500,
+                            rows_saved=1500,
+                            is_full_run=False,
+                            is_authoritative=True,
+                        )
+                self.assertEqual(len(invalid_cursor.executions), 1)
+
+    def test_run_scoped_results_require_stable_result_keys(self):
+        result_without_key = {
+            "run_id": "run-123",
+            "experiment_name": "baseline",
+            "question_id": "7",
+        }
+
+        with patch.object(results_logger, "create_results_table"):
+            with self.assertRaisesRegex(ValueError, "requires result_key"):
+                results_logger.log_question_result(result_without_key)
+
+            with self.assertRaisesRegex(ValueError, "requires result_key"):
+                results_logger.log_question_results(
+                    [result_without_key],
+                    ensure_table=False,
+                )
+
+        cursor = _FakeCursor(rows=[])
+        connection = _FakeConnection(cursor)
+        with (
+            patch.object(results_logger, "create_results_table"),
+            patch.object(
+                results_logger,
+                "get_connection",
+                return_value=connection,
+            ),
+        ):
+            rows = results_logger.get_run_results_for_resume("run-123")
+
+        query, params = cursor.executions[0]
+        normalized_query = " ".join(query.split())
+        self.assertIn("result_key", normalized_query)
+        self.assertIn("WHERE run_id = %s", normalized_query)
+        self.assertEqual(params, ("run-123",))
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":
