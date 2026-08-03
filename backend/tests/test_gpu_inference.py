@@ -171,8 +171,10 @@ class GpuInferencePathTests(unittest.TestCase):
 
         self.assertIs(model, cross_encoder.return_value)
         cross_encoder.assert_called_once_with(
-            "BAAI/bge-reranker-v2-m3",
+            retriever.DEFAULT_RERANKER_MODEL,
             device="cuda",
+            revision=retriever.DEFAULT_RERANKER_REVISION,
+            trust_remote_code=True,
         )
 
     @patch("app.rag.retriever.embed_queries", return_value=[[0.1, 0.2]])

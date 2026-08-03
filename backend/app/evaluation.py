@@ -115,6 +115,32 @@ def _tokens(text):
     return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).split()
 
 
+def _docfinqa_evidence_overlap_from_features(
+    chunk_token_set,
+    chunk_ngrams,
+    evidence_tokens,
+    evidence_ngrams,
+    n=DOCFINQA_NGRAM_SIZE,
+):
+    """Calculates evidence overlap from precomputed token features."""
+
+    if not evidence_tokens:
+        return 0.0
+
+    if len(evidence_tokens) < n:
+        matched_tokens = sum(
+            1
+            for token in evidence_tokens
+            if token in chunk_token_set
+        )
+        return matched_tokens / len(evidence_tokens)
+
+    if not evidence_ngrams:
+        return 0.0
+
+    return len(chunk_ngrams & evidence_ngrams) / len(evidence_ngrams)
+
+
 def docfinqa_evidence_overlap(
     chunk_text,
     gold_evidence,
@@ -125,23 +151,15 @@ def docfinqa_evidence_overlap(
     chunk_tokens = _tokens(chunk_text)
     evidence_tokens = _tokens(gold_evidence)
 
-    if not evidence_tokens:
-        return 0.0
-
-    if len(evidence_tokens) < n:
-        matched_tokens = sum(
-            1
-            for token in evidence_tokens
-            if token in chunk_tokens
-        )
-        return matched_tokens / len(evidence_tokens)
-
     chunk_ngrams = _ngrams(chunk_tokens, n)
     evidence_ngrams = _ngrams(evidence_tokens, n)
-    if not evidence_ngrams:
-        return 0.0
-
-    return len(chunk_ngrams & evidence_ngrams) / len(evidence_ngrams)
+    return _docfinqa_evidence_overlap_from_features(
+        set(chunk_tokens),
+        chunk_ngrams,
+        evidence_tokens,
+        evidence_ngrams,
+        n=n,
+    )
 
 
 def align_docfinqa_evidence(gold_evidence, all_question_chunks):
@@ -157,22 +175,51 @@ def align_docfinqa_evidence(gold_evidence, all_question_chunks):
     unique_evidence = []
     seen_evidence = set()
     for evidence_text in gold_evidence:
-        normalized = " ".join(_tokens(evidence_text))
+        evidence_tokens = _tokens(evidence_text)
+        normalized = " ".join(evidence_tokens)
         if normalized and normalized not in seen_evidence:
             seen_evidence.add(normalized)
-            unique_evidence.append(str(evidence_text))
+            unique_evidence.append(
+                {
+                    "text": str(evidence_text),
+                    "tokens": evidence_tokens,
+                    "ngrams": _ngrams(
+                        evidence_tokens,
+                        DOCFINQA_NGRAM_SIZE,
+                    ),
+                }
+            )
 
     if not unique_evidence:
         raise ValueError("FinQA returned no usable gold supporting evidence.")
 
+    chunk_features = []
+    for chunk in all_question_chunks:
+        chunk_tokens = _tokens(chunk["text"])
+        chunk_features.append(
+            {
+                "id": chunk["id"],
+                "token_set": set(chunk_tokens),
+                "ngrams": _ngrams(
+                    chunk_tokens,
+                    DOCFINQA_NGRAM_SIZE,
+                ),
+            }
+        )
+
     alignments = []
-    for evidence_text in unique_evidence:
+    for evidence in unique_evidence:
         scored_chunks = [
             (
-                docfinqa_evidence_overlap(chunk["text"], evidence_text),
+                _docfinqa_evidence_overlap_from_features(
+                    chunk["token_set"],
+                    chunk["ngrams"],
+                    evidence["tokens"],
+                    evidence["ngrams"],
+                ),
                 chunk["id"],
             )
-            for chunk in all_question_chunks
+            for chunk in chunk_features
         ]
         best_score = max(
             (score for score, chunk_id in scored_chunks),
@@ -186,7 +233,7 @@ def align_docfinqa_evidence(gold_evidence, all_question_chunks):
 
         alignments.append(
             {
-                "evidence": evidence_text,
+                "evidence": evidence["text"],
                 "score": best_score,
                 "target_chunk_ids": target_chunk_ids,
             }

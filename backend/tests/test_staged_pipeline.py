@@ -97,21 +97,43 @@ def _retrieval_metrics():
     }
 
 
+def _sweep_output(retrieval_configs, max_top_k=10):
+    chunks = _chunks(max(40, max_top_k))
+    return {
+        "all_chunks": chunks,
+        "rankings": {
+            config: [dict(chunk) for chunk in chunks[:max_top_k]]
+            for config in retrieval_configs
+        },
+        "timings": {
+            "corpus_load_seconds": 0.0,
+            "keyword_ranking_seconds": 0.0,
+            "semantic_ranking_seconds": 0.0,
+            "hybrid_fusion_seconds": 0.0,
+            "reranking_seconds": 0.0,
+        },
+    }
+
+
 class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.evaluate_retrieval")
-    @patch("app.rag.pipeline.get_top_k_chunks")
-    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.align_docfinqa_evidence", return_value=[])
+    @patch("app.rag.pipeline.get_finqa_gold_evidence", return_value=["evidence"])
+    @patch("app.rag.pipeline.get_parameter_sweep_rankings")
     @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
     def test_retrieval_sweep_includes_off_and_all_reranker_pools(
         self,
         iter_examples,
-        evidence_alignment,
-        get_top_k,
+        get_sweep_rankings,
+        _gold_evidence,
+        _align_evidence,
         evaluate_retrieval,
     ):
         iter_examples.return_value = iter([_example()])
-        evidence_alignment.return_value = []
-        get_top_k.return_value = _chunks()
+        get_sweep_rankings.side_effect = lambda **kwargs: _sweep_output(
+            kwargs["retrieval_configs"],
+            kwargs["max_top_k"],
+        )
         evaluate_retrieval.return_value = _retrieval_metrics()
 
         summary = top_chunks(
@@ -146,7 +168,16 @@ class StagedPipelineTests(unittest.TestCase):
                 },
             ],
         )
-        self.assertEqual(get_top_k.call_count, 4)
+        get_sweep_rankings.assert_called_once()
+        self.assertEqual(
+            set(get_sweep_rankings.call_args.kwargs["retrieval_configs"]),
+            {
+                ("semantic", False, None),
+                ("semantic", True, 10),
+                ("semantic", True, 20),
+                ("semantic", True, 40),
+            },
+        )
         self.assertEqual(
             {
                 (
@@ -177,14 +208,16 @@ class StagedPipelineTests(unittest.TestCase):
     @patch("app.rag.pipeline.update_experiment_run_progress")
     @patch("app.rag.pipeline.create_results_table")
     @patch("app.rag.pipeline.evaluate_retrieval")
-    @patch("app.rag.pipeline.get_top_k_chunks")
-    @patch("app.rag.pipeline._get_docfinqa_evidence_alignment")
+    @patch("app.rag.pipeline.align_docfinqa_evidence", return_value=[])
+    @patch("app.rag.pipeline.get_finqa_gold_evidence", return_value=["evidence"])
+    @patch("app.rag.pipeline.get_parameter_sweep_rankings")
     @patch("app.rag.pipeline.iter_sampled_docfinqa_examples")
     def test_partial_retrieval_run_is_tracked_but_not_marked_full(
         self,
         iter_examples,
-        evidence_alignment,
-        get_top_k,
+        get_sweep_rankings,
+        _gold_evidence,
+        _align_evidence,
         evaluate_retrieval,
         _create_table,
         update_progress,
@@ -193,8 +226,10 @@ class StagedPipelineTests(unittest.TestCase):
         complete_run,
     ):
         iter_examples.return_value = iter([_example()])
-        evidence_alignment.return_value = []
-        get_top_k.return_value = _chunks()
+        get_sweep_rankings.side_effect = lambda **kwargs: _sweep_output(
+            kwargs["retrieval_configs"],
+            kwargs["max_top_k"],
+        )
         evaluate_retrieval.return_value = _retrieval_metrics()
 
         summary = top_chunks(
@@ -236,6 +271,18 @@ class StagedPipelineTests(unittest.TestCase):
             start_arguments["parameters"]["sample_size"],
             300,
         )
+        self.assertEqual(
+            start_arguments["parameters"]["reranker_model"],
+            "jinaai/jina-reranker-v1-tiny-en",
+        )
+        self.assertEqual(
+            start_arguments["parameters"]["reranker_model_revision"],
+            "aca45de6945b5dc6399abcd2a9c55ded5dc9111f",
+        )
+        self.assertEqual(
+            start_arguments["parameters"]["semantic_search_backend"],
+            "chroma_hnsw_depth_200",
+        )
         update_progress.assert_called_once_with(
             run_id="train-run-id",
             questions_processed=1,
@@ -243,6 +290,163 @@ class StagedPipelineTests(unittest.TestCase):
         )
         complete_run.assert_called_once_with(
             run_id="train-run-id",
+            questions_processed=1,
+            rows_saved=1,
+            is_full_run=False,
+            is_authoritative=False,
+        )
+
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline.align_docfinqa_evidence", return_value=[])
+    @patch("app.rag.pipeline.get_finqa_gold_evidence", return_value=["evidence"])
+    @patch("app.rag.pipeline.get_parameter_sweep_rankings")
+    @patch("app.rag.pipeline._materialize_protocol_examples")
+    def test_default_retrieval_sweep_builds_324_unique_results_from_9_corpora(
+        self,
+        materialize_examples,
+        get_sweep_rankings,
+        _gold_evidence,
+        _align_evidence,
+        evaluate_retrieval,
+    ):
+        materialize_examples.return_value = ([_example()], ["1"])
+        get_sweep_rankings.side_effect = lambda **kwargs: _sweep_output(
+            kwargs["retrieval_configs"],
+            kwargs["max_top_k"],
+        )
+        evaluate_retrieval.return_value = _retrieval_metrics()
+
+        summary = top_chunks(
+            split="train",
+            log_results=False,
+            return_results=True,
+        )
+
+        self.assertEqual(summary["parameter_combinations_per_question"], 324)
+        self.assertEqual(summary["rows_processed"], 324)
+        self.assertEqual(summary["results_returned"], 324)
+        self.assertEqual(len(summary["results"]), 324)
+        self.assertEqual(
+            len({result["result_key"] for result in summary["results"]}),
+            324,
+        )
+        self.assertEqual(
+            len(
+                {
+                    (
+                        result["chunk_size"],
+                        result["chunk_strategy"],
+                        result["retrieval_method"],
+                        result["top_k"],
+                        result["reranker_used"],
+                        result["reranker_pool_size"],
+                    )
+                    for result in summary["results"]
+                }
+            ),
+            324,
+        )
+        self.assertEqual(get_sweep_rankings.call_count, 9)
+        self.assertEqual(
+            sum(not result["reranker_used"] for result in summary["results"]),
+            81,
+        )
+        for pool_size in (10, 20, 40):
+            self.assertEqual(
+                sum(
+                    result["reranker_used"]
+                    and result["reranker_pool_size"] == pool_size
+                    for result in summary["results"]
+                ),
+                81,
+            )
+        self.assertTrue(
+            all(
+                len(call.kwargs["retrieval_configs"]) == 12
+                for call in get_sweep_rankings.call_args_list
+            )
+        )
+
+    @patch("app.rag.pipeline.complete_experiment_run")
+    @patch("app.rag.pipeline.start_experiment_run")
+    @patch("app.rag.pipeline.resume_experiment_run")
+    @patch("app.rag.pipeline.get_run_results_for_resume")
+    @patch("app.rag.pipeline.log_question_results")
+    @patch("app.rag.pipeline.update_experiment_run_progress")
+    @patch("app.rag.pipeline.create_results_table")
+    @patch("app.rag.pipeline.evaluate_retrieval")
+    @patch("app.rag.pipeline.align_docfinqa_evidence")
+    @patch("app.rag.pipeline.get_finqa_gold_evidence")
+    @patch("app.rag.pipeline.get_parameter_sweep_rankings")
+    @patch("app.rag.pipeline._materialize_protocol_examples")
+    def test_resume_skips_all_retrieval_work_for_checkpointed_question(
+        self,
+        materialize_examples,
+        get_sweep_rankings,
+        get_gold_evidence,
+        align_evidence,
+        evaluate_retrieval,
+        _create_table,
+        update_progress,
+        log_results,
+        get_saved_results,
+        resume_run,
+        start_run,
+        complete_run,
+    ):
+        materialize_examples.return_value = ([_example()], ["1"])
+        get_saved_results.return_value = [
+            {
+                "result_key": (
+                    "1::semantic__fixed__chunk_512__top_3__"
+                    "reranker_off::retrieval"
+                ),
+                "question_id": "1",
+                "is_correct": None,
+                "retrieval_method": "semantic",
+                "chunk_strategy": "fixed",
+                "chunk_size": 512,
+                "top_k": 3,
+                "reranker_used": False,
+                "reranker_pool_size": None,
+                "retrieval_metrics": _retrieval_metrics(),
+                "generation_metrics": {},
+            }
+        ]
+
+        summary = top_chunks(
+            split="train",
+            top_k_values=[3],
+            strategies=["fixed"],
+            retrieval_methods=["semantic"],
+            reranker_enabled_values=[False],
+            chunk_size=512,
+            sample_size=1,
+            resume_run_id="retrieval-resume-run",
+            return_results=True,
+        )
+
+        self.assertEqual(summary["run_id"], "retrieval-resume-run")
+        self.assertEqual(summary["rows_already_saved"], 1)
+        self.assertEqual(summary["rows_added_this_attempt"], 0)
+        self.assertEqual(summary["rows_processed"], 0)
+        self.assertEqual(summary["rows_saved"], 1)
+        self.assertEqual(summary["results_returned"], 0)
+        start_run.assert_not_called()
+        resume_run.assert_called_once()
+        get_saved_results.assert_called_once_with("retrieval-resume-run")
+        get_sweep_rankings.assert_not_called()
+        get_gold_evidence.assert_not_called()
+        align_evidence.assert_not_called()
+        evaluate_retrieval.assert_not_called()
+        log_results.assert_not_called()
+        update_progress.assert_called_once_with(
+            run_id="retrieval-resume-run",
+            questions_processed=1,
+            rows_saved=1,
+        )
+        complete_run.assert_called_once_with(
+            run_id="retrieval-resume-run",
             questions_processed=1,
             rows_saved=1,
             is_full_run=False,
@@ -1026,6 +1230,13 @@ class StagedPipelineTests(unittest.TestCase):
             "source_split": "train",
             "questions_run": 300,
             "updated_at": "2026-07-30",
+            "ranking_rule": {
+                "reranker_model": "jinaai/jina-reranker-v1-tiny-en",
+                "reranker_model_revision": (
+                    "aca45de6945b5dc6399abcd2a9c55ded5dc9111f"
+                ),
+                "semantic_search_backend": "chroma_hnsw_depth_200",
+            },
             "candidates": candidates,
         }
         run_sweep.return_value = {"rows_processed": 0}

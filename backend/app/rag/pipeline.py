@@ -1,5 +1,6 @@
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from time import perf_counter
 from typing import Any
 from app.data.data_loader import (
     BASELINE_SPLIT,
@@ -33,7 +34,14 @@ from app.rag.parameter_selection import (
     rank_parameter_configs,
     rank_retrieval_parameter_configs,
 )
-from app.rag.retriever import get_all_chunks, get_top_k_chunks
+from app.rag.retriever import (
+    DEFAULT_RERANKER_MODEL,
+    DEFAULT_RERANKER_REVISION,
+    SEMANTIC_SEARCH_BACKEND,
+    get_all_chunks,
+    get_parameter_sweep_rankings,
+    get_top_k_chunks,
+)
 from app.rag.vector_store import DEFAULT_CHUNK_SIZES
 from app.statistical_analysis import analyze_paired_binary_outcomes, holm_adjust
 from app.results_logger import (
@@ -294,7 +302,7 @@ def _compact_retrieved_chunks(chunks):
         {
             key: value
             for key, value in chunk.items()
-            if key != "text"
+            if key not in {"text", "embedding"}
         }
         for chunk in chunks
     ]
@@ -547,6 +555,9 @@ def full_rag_parameter_sweep(
         "retrieval_methods": list(retrieval_methods),
         "chunk_sizes": list(chunk_sizes),
         "reranker_configurations": [list(value) for value in reranker_configs],
+        "reranker_model": DEFAULT_RERANKER_MODEL,
+        "reranker_model_revision": DEFAULT_RERANKER_REVISION,
+        "semantic_search_backend": SEMANTIC_SEARCH_BACKEND,
     }
 
     results = []
@@ -727,6 +738,26 @@ def full_rag_parameter_sweep(
                                 )
                                 retrieval_metrics["reranker_pool_size"] = (
                                     config["reranker_pool_size"]
+                                )
+                                retrieval_metrics["reranker_model"] = (
+                                    DEFAULT_RERANKER_MODEL
+                                    if config["reranker_enabled"]
+                                    else None
+                                )
+                                retrieval_metrics[
+                                    "reranker_model_revision"
+                                ] = (
+                                    DEFAULT_RERANKER_REVISION
+                                    if config["reranker_enabled"]
+                                    else None
+                                )
+                                retrieval_metrics[
+                                    "semantic_search_backend"
+                                ] = (
+                                    SEMANTIC_SEARCH_BACKEND
+                                    if retrieval_method
+                                    in {"semantic", "hybrid"}
+                                    else None
                                 )
                                 generation_chunks = limit_chunks_to_prompt_budget(
                                     question=example["question"],
@@ -1014,6 +1045,9 @@ def full_rag_parameter_sweep(
         "top_k_values": top_k_values,
         "reranker_enabled_values": reranker_enabled_values,
         "reranker_pool_sizes": reranker_pool_sizes,
+        "reranker_model": DEFAULT_RERANKER_MODEL,
+        "reranker_model_revision": DEFAULT_RERANKER_REVISION,
+        "semantic_search_backend": SEMANTIC_SEARCH_BACKEND,
         "reranker_configurations": [
             {
                 "reranker_enabled": enabled,
@@ -1089,6 +1123,20 @@ def full_rag_shortlist_sweep(
             raise RuntimeError(
                 "No completed train retrieval shortlist was found. "
                 "Run POST /run-chunk-rag first."
+            )
+        ranking_rule = saved_shortlist.get("ranking_rule") or {}
+        expected_retrieval_provenance = {
+            "reranker_model": DEFAULT_RERANKER_MODEL,
+            "reranker_model_revision": DEFAULT_RERANKER_REVISION,
+            "semantic_search_backend": SEMANTIC_SEARCH_BACKEND,
+        }
+        if any(
+            ranking_rule.get(key) != value
+            for key, value in expected_retrieval_provenance.items()
+        ):
+            raise RuntimeError(
+                "The saved retrieval shortlist uses a different reranker "
+                "or semantic search backend. Run POST /run-chunk-rag again."
             )
         candidates = saved_shortlist.get("candidates") or []
         candidate_configs = [
@@ -1227,6 +1275,9 @@ def top_chunks(
         "retrieval_methods": list(retrieval_methods),
         "chunk_sizes": list(chunk_sizes),
         "reranker_configurations": [list(value) for value in reranker_configs],
+        "reranker_model": DEFAULT_RERANKER_MODEL,
+        "reranker_model_revision": DEFAULT_RERANKER_REVISION,
+        "semantic_search_backend": SEMANTIC_SEARCH_BACKEND,
         "ranking_weights": RETRIEVAL_SCORE_WEIGHTS,
         "shortlist_size": RETRIEVAL_SHORTLIST_SIZE,
     }
@@ -1239,6 +1290,18 @@ def top_chunks(
     run_id = None
     existing_rows = []
     existing_keys = set()
+    phase_timings = {
+        "corpus_load_seconds": 0.0,
+        "keyword_ranking_seconds": 0.0,
+        "semantic_ranking_seconds": 0.0,
+        "hybrid_fusion_seconds": 0.0,
+        "reranking_seconds": 0.0,
+        "evidence_alignment_seconds": 0.0,
+        "metric_evaluation_seconds": 0.0,
+        "database_seconds": 0.0,
+    }
+    working_question_durations = []
+    sweep_started = perf_counter()
 
     if log_results:
         create_results_table()
@@ -1285,9 +1348,13 @@ def top_chunks(
         if not pending_results:
             return
 
+        database_started = perf_counter()
         result_ids = log_question_results(
             pending_results,
             ensure_table=False,
+        )
+        phase_timings["database_seconds"] += (
+            perf_counter() - database_started
         )
         for result, result_id in zip(pending_results, result_ids):
             result["result_id"] = result_id
@@ -1299,41 +1366,22 @@ def top_chunks(
         )
         pending_results.clear()
 
+    max_top_k = max(top_k_values)
     for question_number, example in enumerate(examples, start=1):
+        question_started = perf_counter()
+        filter_work = []
+
         for current_chunk_size in chunk_sizes:
             for strategy in strategies:
-                where = {
-                    "$and": [
-                        {"document_id": {"$eq": example["document_id"]}},
-                        {"strategy": {"$eq": strategy}},
-                        {"chunk_size": {"$eq": current_chunk_size}},
-                    ]
-                }
-                evidence_alignment = _get_docfinqa_evidence_alignment(
-                    example=example,
-                    split=split,
-                    where=where,
-                )
-
+                missing_by_retrieval_config = {}
                 for retrieval_method in retrieval_methods:
-                    for (
-                        reranker_enabled,
-                        reranker_pool_size,
-                    ) in reranker_configs:
-                        ranked_chunks = get_top_k_chunks(
-                            question=example["question"],
-                            top_k=max(top_k_values),
-                            where=where,
-                            retrieval_method=retrieval_method,
-                            reranker_enabled=reranker_enabled,
-                            reranker_pool_size=(
-                                reranker_pool_size
-                                or OPTIMIZED_RAG_CONFIG[
-                                    "reranker_pool_size"
-                                ]
-                            ),
+                    for reranker_enabled, reranker_pool_size in reranker_configs:
+                        retrieval_config = (
+                            retrieval_method,
+                            reranker_enabled,
+                            reranker_pool_size,
                         )
-
+                        missing_results = []
                         for top_k in top_k_values:
                             config = {
                                 "chunk_size": current_chunk_size,
@@ -1352,89 +1400,201 @@ def top_chunks(
                                 config,
                                 "retrieval",
                             )
-                            if result_key in existing_keys:
-                                continue
+                            if result_key not in existing_keys:
+                                missing_results.append((config, result_key))
 
-                            chunks = [
-                                dict(chunk)
-                                for chunk in ranked_chunks[:top_k]
-                            ]
-                            retrieval_metrics = evaluate_retrieval(
-                                chunks=chunks,
-                                k=top_k,
-                                evidence_alignment=evidence_alignment,
-                            )
-                            retrieval_metrics["reranker_pool_size"] = (
-                                reranker_pool_size
-                                if reranker_enabled
-                                else None
-                            )
-                            record_retrieval_result(
-                                parameter_scores=parameter_scores,
-                                config_key=(
-                                    current_chunk_size,
-                                    strategy,
-                                    retrieval_method,
-                                    top_k,
-                                    reranker_enabled,
-                                    reranker_pool_size,
-                                ),
-                                retrieval_metrics=retrieval_metrics,
+                        if missing_results:
+                            missing_by_retrieval_config[retrieval_config] = (
+                                missing_results
                             )
 
-                            result = {
-                                "run_id": run_id,
-                                "result_key": result_key,
-                                "experiment_name": (
-                                    RETRIEVAL_SWEEP_EXPERIMENT
-                                ),
-                                "dataset": "docfinqa",
-                                "split": split,
-                                "question_id": example["question_id"],
-                                "question": example["question"],
-                                "gold_answer": example["gold_answer"],
-                                "generated_answer": None,
-                                "is_correct": None,
-                                "retrieval_method": retrieval_method,
-                                "chunk_strategy": strategy,
-                                "chunk_size": current_chunk_size,
-                                "top_k": top_k,
-                                "reranker_used": reranker_enabled,
-                                "reranker_pool_size": (
-                                    reranker_pool_size
-                                    if reranker_enabled
-                                    else None
-                                ),
-                                "retrieved_chunk_ids": [
-                                    chunk["id"]
-                                    for chunk in chunks
-                                ],
-                                "retrieved_chunks": (
-                                    _compact_retrieved_chunks(chunks)
-                                ),
-                                "retrieval_metrics": retrieval_metrics,
-                                "generation_metrics": {},
-                            }
-                            rows_processed += 1
+                if missing_by_retrieval_config:
+                    filter_work.append(
+                        (
+                            current_chunk_size,
+                            strategy,
+                            {
+                                "$and": [
+                                    {
+                                        "document_id": {
+                                            "$eq": example["document_id"]
+                                        }
+                                    },
+                                    {"strategy": {"$eq": strategy}},
+                                    {
+                                        "chunk_size": {
+                                            "$eq": current_chunk_size
+                                        }
+                                    },
+                                ]
+                            },
+                            missing_by_retrieval_config,
+                        )
+                    )
 
-                            if return_results:
-                                results.append(result)
+        if filter_work:
+            gold_evidence = get_finqa_gold_evidence(
+                split=split,
+                question=example["question"],
+                gold_answer=example["gold_answer"],
+            )
 
-                            if log_results:
-                                pending_results.append(result)
-                                if len(pending_results) >= RESULT_LOG_BATCH_SIZE:
-                                    flush_pending_results()
+        for filter_number, (
+            current_chunk_size,
+            strategy,
+            where,
+            missing_by_retrieval_config,
+        ) in enumerate(filter_work, start=1):
+            filter_started = perf_counter()
+            sweep_rankings = get_parameter_sweep_rankings(
+                question=example["question"],
+                max_top_k=max_top_k,
+                where=where,
+                retrieval_configs=list(missing_by_retrieval_config),
+            )
+            for timing_name, seconds in sweep_rankings["timings"].items():
+                phase_timings[timing_name] += seconds
+
+            evidence_started = perf_counter()
+            evidence_alignment = align_docfinqa_evidence(
+                gold_evidence=gold_evidence,
+                all_question_chunks=sweep_rankings["all_chunks"],
+            )
+            phase_timings["evidence_alignment_seconds"] += (
+                perf_counter() - evidence_started
+            )
+
+            for retrieval_config, missing_results in (
+                missing_by_retrieval_config.items()
+            ):
+                retrieval_method, reranker_enabled, reranker_pool_size = (
+                    retrieval_config
+                )
+                ranked_chunks = sweep_rankings["rankings"][retrieval_config]
+
+                for config, result_key in missing_results:
+                    top_k = config["top_k"]
+                    chunks = [
+                        dict(chunk)
+                        for chunk in ranked_chunks[:top_k]
+                    ]
+                    evaluation_started = perf_counter()
+                    retrieval_metrics = evaluate_retrieval(
+                        chunks=chunks,
+                        k=top_k,
+                        evidence_alignment=evidence_alignment,
+                    )
+                    phase_timings["metric_evaluation_seconds"] += (
+                        perf_counter() - evaluation_started
+                    )
+                    retrieval_metrics["reranker_pool_size"] = (
+                        reranker_pool_size
+                        if reranker_enabled
+                        else None
+                    )
+                    retrieval_metrics["reranker_model"] = (
+                        DEFAULT_RERANKER_MODEL
+                        if reranker_enabled
+                        else None
+                    )
+                    retrieval_metrics["reranker_model_revision"] = (
+                        DEFAULT_RERANKER_REVISION
+                        if reranker_enabled
+                        else None
+                    )
+                    retrieval_metrics["semantic_search_backend"] = (
+                        SEMANTIC_SEARCH_BACKEND
+                        if retrieval_method in {"semantic", "hybrid"}
+                        else None
+                    )
+                    record_retrieval_result(
+                        parameter_scores=parameter_scores,
+                        config_key=(
+                            current_chunk_size,
+                            strategy,
+                            retrieval_method,
+                            top_k,
+                            reranker_enabled,
+                            reranker_pool_size,
+                        ),
+                        retrieval_metrics=retrieval_metrics,
+                    )
+
+                    result = {
+                        "run_id": run_id,
+                        "result_key": result_key,
+                        "experiment_name": RETRIEVAL_SWEEP_EXPERIMENT,
+                        "dataset": "docfinqa",
+                        "split": split,
+                        "question_id": example["question_id"],
+                        "question": example["question"],
+                        "gold_answer": example["gold_answer"],
+                        "generated_answer": None,
+                        "is_correct": None,
+                        "retrieval_method": retrieval_method,
+                        "chunk_strategy": strategy,
+                        "chunk_size": current_chunk_size,
+                        "top_k": top_k,
+                        "reranker_used": reranker_enabled,
+                        "reranker_pool_size": (
+                            reranker_pool_size
+                            if reranker_enabled
+                            else None
+                        ),
+                        "retrieved_chunk_ids": [
+                            chunk["id"] for chunk in chunks
+                        ],
+                        "retrieved_chunks": _compact_retrieved_chunks(chunks),
+                        "retrieval_metrics": retrieval_metrics,
+                        "generation_metrics": {},
+                    }
+                    rows_processed += 1
+
+                    if return_results:
+                        results.append(result)
+
+                    if log_results:
+                        pending_results.append(result)
+                        if len(pending_results) >= RESULT_LOG_BATCH_SIZE:
+                            flush_pending_results()
+
+            print(
+                f"{RETRIEVAL_SWEEP_EXPERIMENT}: "
+                f"question {question_number}/{len(examples)}, "
+                f"corpus {filter_number}/{len(filter_work)} complete "
+                f"({strategy}, chunk_size={current_chunk_size}); "
+                f"corpus_seconds={perf_counter() - filter_started:.2f}",
+                flush=True,
+            )
 
         if log_results:
             flush_pending_results()
+            database_started = perf_counter()
             update_experiment_run_progress(
                 run_id=run_id,
                 questions_processed=question_number,
                 rows_saved=rows_saved,
             )
+            phase_timings["database_seconds"] += (
+                perf_counter() - database_started
+            )
+
+        question_seconds = perf_counter() - question_started
+        if filter_work:
+            working_question_durations.append(question_seconds)
+        average_seconds = (
+            sum(working_question_durations) / len(working_question_durations)
+            if working_question_durations
+            else 0.0
+        )
+        estimated_hours = (
+            average_seconds * (len(examples) - question_number) / 3600
+        )
         print(
             f"{RETRIEVAL_SWEEP_EXPERIMENT}: "
-            f"{question_number}/{len(examples)} questions checkpointed",
+            f"{question_number}/{len(examples)} questions checkpointed; "
+            f"question_seconds={question_seconds:.2f}; "
+            f"estimated_remaining_hours={estimated_hours:.2f}",
             flush=True,
         )
 
@@ -1486,6 +1646,9 @@ def top_chunks(
                 "sample_size": sample_size,
                 "sample_seed": sample_seed,
                 "question_ids": question_ids,
+                "reranker_model": DEFAULT_RERANKER_MODEL,
+                "reranker_model_revision": DEFAULT_RERANKER_REVISION,
+                "semantic_search_backend": SEMANTIC_SEARCH_BACKEND,
                 "tie_breakers": [
                     "avg_all_evidence_hit_at_k",
                     "avg_evidence_recall_at_k",
@@ -1516,6 +1679,24 @@ def top_chunks(
             is_authoritative=shortlist_saved,
         )
 
+    total_elapsed_seconds = perf_counter() - sweep_started
+    timing_summary = {
+        key: round(value, 3)
+        for key, value in phase_timings.items()
+    }
+    timing_summary["total_elapsed_seconds"] = round(
+        total_elapsed_seconds,
+        3,
+    )
+    timing_summary["average_working_question_seconds"] = round(
+        (
+            sum(working_question_durations) / len(working_question_durations)
+            if working_question_durations
+            else 0.0
+        ),
+        3,
+    )
+
     summary = {
         "run_id": run_id,
         "is_full_run": is_full_run,
@@ -1535,6 +1716,9 @@ def top_chunks(
         "top_k_values": top_k_values,
         "reranker_enabled_values": reranker_enabled_values,
         "reranker_pool_sizes": reranker_pool_sizes,
+        "reranker_model": DEFAULT_RERANKER_MODEL,
+        "reranker_model_revision": DEFAULT_RERANKER_REVISION,
+        "semantic_search_backend": SEMANTIC_SEARCH_BACKEND,
         "reranker_configurations": [
             {
                 "reranker_enabled": enabled,
@@ -1549,6 +1733,7 @@ def top_chunks(
         "rows_already_saved": len(existing_rows),
         "rows_added_this_attempt": rows_added_this_attempt,
         "results_returned": len(results),
+        "timings": timing_summary,
         "retrieval_score_weights": RETRIEVAL_SCORE_WEIGHTS,
         "top_retrieval_candidates": top_candidates,
         "shortlist_saved": shortlist_saved,

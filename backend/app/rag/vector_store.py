@@ -1,6 +1,7 @@
 import itertools
 import os
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from app.data.data_loader import iter_unique_documents
@@ -15,6 +16,11 @@ DEFAULT_CHUNK_STRATEGIES = ["fixed", "sentence", "section"]
 DEFAULT_CHUNK_SIZES = [256, 512, 1024]
 
 
+_CHROMA_CACHE_LOCK = RLock()
+_CHROMA_CLIENT_CACHE: dict[str, Any] = {}
+_CHROMA_COLLECTION_CACHE: dict[tuple[str, str], Any] = {}
+
+
 def get_chroma_path() -> str:
     """
     Returns the directory where Chroma should persist its local vector database.
@@ -23,22 +29,36 @@ def get_chroma_path() -> str:
     return os.getenv("CHROMA_PERSIST_DIR", DEFAULT_CHROMA_PATH)
 
 
+def _get_normalized_chroma_path() -> str:
+    """Returns one stable cache key for the configured persistence directory."""
+
+    return str(Path(get_chroma_path()).expanduser().resolve())
+
+
 def get_chroma_client():
     """
-    Creates a persistent Chroma client and ensures the storage directory exists.
+    Gets or creates a process-local persistent Chroma client.
     """
 
-    try:
-        import chromadb
-    except ImportError as exc:
-        raise RuntimeError(
-            "ChromaDB is not installed. Run `pip install -r backend/requirements.txt` "
-            "or rebuild the backend container."
-        ) from exc
+    persist_path = _get_normalized_chroma_path()
 
-    persist_path = Path(get_chroma_path())
-    persist_path.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(path=str(persist_path))
+    with _CHROMA_CACHE_LOCK:
+        cached_client = _CHROMA_CLIENT_CACHE.get(persist_path)
+        if cached_client is not None:
+            return cached_client
+
+        try:
+            import chromadb
+        except ImportError as exc:
+            raise RuntimeError(
+                "ChromaDB is not installed. Run `pip install -r backend/requirements.txt` "
+                "or rebuild the backend container."
+            ) from exc
+
+        Path(persist_path).mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=persist_path)
+        _CHROMA_CLIENT_CACHE[persist_path] = client
+        return client
 
 
 def get_collection(collection_name: str = DEFAULT_COLLECTION_NAME):
@@ -46,11 +66,21 @@ def get_collection(collection_name: str = DEFAULT_COLLECTION_NAME):
     Gets or creates the Chroma collection used to store DocFinQA chunks.
     """
 
-    client = get_chroma_client()
-    return client.get_or_create_collection(
-        name=collection_name,
-        metadata={"description": "DocFinQA chunks for Week 2 semantic retrieval"},
-    )
+    persist_path = _get_normalized_chroma_path()
+    cache_key = (persist_path, collection_name)
+
+    with _CHROMA_CACHE_LOCK:
+        cached_collection = _CHROMA_COLLECTION_CACHE.get(cache_key)
+        if cached_collection is not None:
+            return cached_collection
+
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={"description": "DocFinQA chunks for Week 2 semantic retrieval"},
+        )
+        _CHROMA_COLLECTION_CACHE[cache_key] = collection
+        return collection
 
 
 def reset_collection(collection_name: str = DEFAULT_COLLECTION_NAME):
@@ -58,14 +88,21 @@ def reset_collection(collection_name: str = DEFAULT_COLLECTION_NAME):
     Deletes and recreates a Chroma collection so indexing can start fresh.
     """
 
-    client = get_chroma_client()
+    persist_path = _get_normalized_chroma_path()
+    cache_key = (persist_path, collection_name)
 
-    try:
-        client.delete_collection(collection_name)
-    except Exception:
-        pass
+    with _CHROMA_CACHE_LOCK:
+        client = get_chroma_client()
+        _CHROMA_COLLECTION_CACHE.pop(cache_key, None)
 
-    return client.get_or_create_collection(name=collection_name)
+        try:
+            client.delete_collection(collection_name)
+        except Exception:
+            pass
+
+        collection = client.get_or_create_collection(name=collection_name)
+        _CHROMA_COLLECTION_CACHE[cache_key] = collection
+        return collection
 
 
 def count_docfinqa_samples(
