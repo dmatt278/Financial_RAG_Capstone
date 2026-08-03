@@ -78,10 +78,10 @@ OPTIMIZED_RAG_CONFIG = {
 RESULT_LOG_BATCH_SIZE = 500
 FULL_RAG_RESULT_LOG_BATCH_SIZE = 100
 DEFAULT_OPENAI_CONCURRENCY = 4
-TRAIN_SAMPLE_SIZE = 300
-DEV_SAMPLE_SIZE = 500
-TEST_SAMPLE_SIZE = 500
-MATH_SAMPLE_SIZE = 100
+TRAIN_SAMPLE_SIZE = 50
+DEV_SAMPLE_SIZE = 100
+TEST_SAMPLE_SIZE = 100
+MATH_SAMPLE_SIZE = 50
 FULL_RAG_TOP_K_VALUES = (3, 5, 10)
 FULL_RAG_STRATEGIES = ("fixed", "sentence", "section")
 FULL_RAG_RETRIEVAL_METHODS = ("keyword", "semantic", "hybrid")
@@ -2376,7 +2376,7 @@ def full_rag_with_math_agent(
         "statistical_analysis_save_reason": (
             None
             if statistical_analyses_saved
-            else "complete_100_question_protocol_required"
+            else "complete_50_question_protocol_required"
         ),
         "results_returned": len(results),
     }

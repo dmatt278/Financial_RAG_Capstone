@@ -250,7 +250,7 @@ class StagedPipelineTests(unittest.TestCase):
         self.assertEqual(summary["results"][0]["run_id"], "train-run-id")
         iter_examples.assert_called_once_with(
             split="train",
-            sample_size=300,
+            sample_size=50,
             seed=42,
         )
         start_run.assert_called_once()
@@ -269,7 +269,7 @@ class StagedPipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             start_arguments["parameters"]["sample_size"],
-            300,
+            50,
         )
         self.assertEqual(
             start_arguments["parameters"]["reranker_model"],
@@ -1228,7 +1228,7 @@ class StagedPipelineTests(unittest.TestCase):
         get_shortlist.return_value = {
             "source_experiment": "top_chunks_evidence_sweep",
             "source_split": "train",
-            "questions_run": 300,
+            "questions_run": 50,
             "updated_at": "2026-07-30",
             "ranking_rule": {
                 "reranker_model": "jinaai/jina-reranker-v1-tiny-en",
@@ -1258,7 +1258,7 @@ class StagedPipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             summary["retrieval_shortlist_source"]["questions_run"],
-            300,
+            50,
         )
 
     @patch("app.rag.pipeline.get_retrieval_shortlist", return_value=None)

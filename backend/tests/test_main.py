@@ -49,10 +49,10 @@ def _load_main_module():
     )
     pipeline = _module(
         "app.rag.pipeline",
-        DEV_SAMPLE_SIZE=500,
-        MATH_SAMPLE_SIZE=100,
-        TEST_SAMPLE_SIZE=500,
-        TRAIN_SAMPLE_SIZE=300,
+        DEV_SAMPLE_SIZE=100,
+        MATH_SAMPLE_SIZE=50,
+        TEST_SAMPLE_SIZE=100,
+        TRAIN_SAMPLE_SIZE=50,
         full_rag_shortlist_sweep=Mock(return_value={"stage": 2}),
         full_rag_with_math_agent=Mock(return_value={"math": True}),
         get_baseline_results=Mock(return_value={"stage": 3}),
@@ -94,7 +94,7 @@ class MainEndpointTests(unittest.TestCase):
             chunk_size=None,
             log_results=True,
             return_results=False,
-            sample_size=300,
+            sample_size=50,
             sample_seed=42,
             resume_run_id="stage-1",
         )
@@ -105,19 +105,19 @@ class MainEndpointTests(unittest.TestCase):
             limit=None,
             log_results=True,
             return_results=False,
-            sample_size=500,
+            sample_size=100,
             sample_seed=42,
             resume_run_id="stage-2",
         )
 
         self.main.get_baselines(resume_run_id="stage-3")
         self.main.get_baseline_results.assert_called_once_with(
-            sample_size=500,
+            sample_size=100,
             sample_seed=42,
             resume_run_id="stage-3",
         )
 
-    def test_math_defaults_to_one_config_and_100_questions(self):
+    def test_math_defaults_to_one_config_and_50_questions(self):
         self.main.full_rag_math_agent_pipeline(resume_run_id="math-run")
 
         self.main.full_rag_with_math_agent.assert_called_once_with(
@@ -130,7 +130,7 @@ class MainEndpointTests(unittest.TestCase):
             chunk_size=512,
             log_results=True,
             return_results=False,
-            sample_size=100,
+            sample_size=50,
             sample_seed=42,
             resume_run_id="math-run",
         )

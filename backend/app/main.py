@@ -96,7 +96,7 @@ def chunk_rag(
     resume_run_id: str | None = None,
 ):
     """
-    Runs all 324 configurations on 300 seeded train questions and saves 3.
+    Runs all 324 configurations on 50 seeded train questions and saves 3.
     """
 
     return _run_long_experiment(
@@ -125,7 +125,7 @@ def full_rag_pipeline(
     resume_run_id: str | None = None,
 ):
     """
-    Runs the saved 3 train retrieval finalists on 500 dev questions and
+    Runs the saved 3 train retrieval finalists on 100 dev questions and
     stores exploratory paired statistical diagnostics.
     """
 
@@ -157,7 +157,7 @@ def full_rag_math_agent_pipeline(
 ):
     """
     Separately compares direct LLM math with LLM-planned calculations executed
-    by the deterministic DocFinQA math tool on 100 seeded questions.
+    by the deterministic DocFinQA math tool on 50 seeded questions.
     """
 
     return _run_long_experiment(

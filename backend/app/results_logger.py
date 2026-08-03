@@ -1477,7 +1477,7 @@ def get_final_result_tables(
             "reporting_role": "exploratory_incomplete_or_custom_run",
             "authoritative": False,
             "warning": (
-                "This run did not complete the predeclared 100-question "
+                "This run did not complete the predeclared 50-question "
                 "math protocol and must not be reported as the final math "
                 "experiment."
             ),
