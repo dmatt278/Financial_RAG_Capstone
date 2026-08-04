@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import random
+import re
+from collections import Counter
 from pathlib import Path
 import shutil
 import tempfile
@@ -10,6 +12,8 @@ import ijson
 from huggingface_hub import hf_hub_download
 from typing import Iterator
 from urllib.request import urlopen
+
+from app.evaluation import docfinqa_evidence_overlap
 
 
 TRAIN_SPLIT = "train"
@@ -121,6 +125,149 @@ def _normalize_finqa_answer(answer) -> str:
         return normalized
 
 
+_FINQA_PROGRAM_NUMBER_PATTERN = re.compile(
+    r"(?<!\w)const_([-+]?(?:(?:\d[\d_]*(?:\.\d[\d_]*)?)|"
+    r"(?:\.\d[\d_]*))(?:e[-+]?\d+)?)"
+    r"|(?<![#\w.])([-+]?(?:(?:\d[\d_]*(?:\.\d[\d_]*)?)|"
+    r"(?:\.\d[\d_]*))(?:e[-+]?\d+)?)(?![\w.])",
+    flags=re.IGNORECASE,
+)
+
+
+def _finqa_program_text(program) -> str:
+    """Returns one comparable string for FinQA or DocFinQA programs."""
+
+    if program is None:
+        return ""
+    if isinstance(program, (list, tuple)):
+        return ";".join(str(step) for step in program)
+    return str(program)
+
+
+def _normalize_finqa_program(program) -> str:
+    """Normalizes formatting without translating program semantics."""
+
+    return re.sub(r"\s+", "", _finqa_program_text(program).lower())
+
+
+def _finqa_program_number_signature(program) -> tuple[str, ...]:
+    """Extracts the numeric operands shared by FinQA and DocFinQA programs."""
+
+    values = []
+    for match in _FINQA_PROGRAM_NUMBER_PATTERN.finditer(
+        _finqa_program_text(program)
+    ):
+        raw_value = (match.group(1) or match.group(2)).replace("_", "")
+        values.append(_normalize_finqa_answer(raw_value))
+    return tuple(sorted(values))
+
+
+def _narrow_finqa_candidates_by_program(
+    candidates: list[dict],
+    gold_program,
+) -> list[dict]:
+    """Uses gold program provenance only when question and answer collide."""
+
+    normalized_program = _normalize_finqa_program(gold_program)
+    if not normalized_program:
+        return candidates
+
+    exact_matches = [
+        candidate
+        for candidate in candidates
+        if _normalize_finqa_program(candidate.get("program"))
+        == normalized_program
+    ]
+    if exact_matches:
+        return exact_matches
+
+    number_signature = Counter(_finqa_program_number_signature(gold_program))
+    if not number_signature:
+        return candidates
+
+    numeric_matches = [
+        candidate
+        for candidate in candidates
+        if (
+            candidate_signature := Counter(
+                _finqa_program_number_signature(candidate.get("program"))
+            )
+        )
+        and all(
+            candidate_signature[value] <= number_signature[value]
+            for value in candidate_signature
+        )
+    ]
+    return numeric_matches or candidates
+
+
+def _finqa_document_evidence_score(
+    document_text: str,
+    gold_evidence: list[str],
+) -> tuple[int, int, float, float]:
+    """Scores how completely one candidate's evidence occurs in a document."""
+
+    overlaps = [
+        docfinqa_evidence_overlap(document_text, evidence)
+        for evidence in gold_evidence
+        if evidence is not None and str(evidence).strip()
+    ]
+    if not overlaps:
+        return (0, 0, 0.0, 0.0)
+
+    return (
+        int(all(overlap >= 0.5 for overlap in overlaps)),
+        sum(overlap >= 1.0 for overlap in overlaps),
+        round(sum(overlaps) / len(overlaps), 12),
+        round(min(overlaps), 12),
+    )
+
+
+def _narrow_finqa_candidates_by_document(
+    candidates: list[dict],
+    document_text,
+) -> list[dict]:
+    """Keeps a unique best source-document evidence match when one exists."""
+
+    if document_text is None or not str(document_text).strip():
+        return candidates
+
+    scored_candidates = [
+        (
+            _finqa_document_evidence_score(
+                str(document_text),
+                candidate["gold_evidence"],
+            ),
+            candidate,
+        )
+        for candidate in candidates
+    ]
+    best_score = max(
+        (score for score, _candidate in scored_candidates),
+        default=(0, 0, 0.0, 0.0),
+    )
+    if best_score[0] == 0:
+        return candidates
+
+    best_candidates = [
+        candidate
+        for score, candidate in scored_candidates
+        if score == best_score
+    ]
+    return best_candidates if len(best_candidates) == 1 else candidates
+
+
+def _canonical_finqa_evidence(gold_evidence: list[str]) -> tuple[str, ...]:
+    """Normalizes evidence sets so order and formatting do not create ties."""
+
+    normalized = {
+        " ".join(re.sub(r"[^a-z0-9]+", " ", str(value).lower()).split())
+        for value in gold_evidence
+        if value is not None and str(value).strip()
+    }
+    return tuple(sorted(value for value in normalized if value))
+
+
 def _get_finqa_supporting_facts(record: dict) -> list[str]:
     """Gets each gold fact in the form most likely to occur in DocFinQA."""
 
@@ -190,6 +337,7 @@ def _get_finqa_evidence_lookup(split: str) -> dict[str, list[dict]]:
                     {
                         "finqa_id": str(record.get("id", "")),
                         "answer": qa.get("exe_ans", qa.get("answer")),
+                        "program": qa.get("program"),
                         "gold_evidence": _get_finqa_supporting_facts(record),
                     }
                 )
@@ -201,8 +349,11 @@ def get_finqa_gold_evidence(
     split: str,
     question: str,
     gold_answer,
+    *,
+    gold_program=None,
+    document_text=None,
 ) -> list[str]:
-    """Matches a DocFinQA question to FinQA and returns its gold evidence."""
+    """Matches a DocFinQA example to FinQA and returns its gold evidence."""
 
     lookup = _get_finqa_evidence_lookup(split)
     candidates = lookup.get(_normalize_finqa_question(question), [])
@@ -225,10 +376,24 @@ def get_finqa_gold_evidence(
 
     possible_matches = answer_matches or candidates
     distinct_evidence = {
-        tuple(candidate["gold_evidence"])
+        _canonical_finqa_evidence(candidate["gold_evidence"])
         for candidate in possible_matches
     }
     if len(distinct_evidence) == 1:
+        return list(possible_matches[0]["gold_evidence"])
+
+    possible_matches = _narrow_finqa_candidates_by_document(
+        possible_matches,
+        document_text,
+    )
+    if len(possible_matches) == 1:
+        return list(possible_matches[0]["gold_evidence"])
+
+    possible_matches = _narrow_finqa_candidates_by_program(
+        possible_matches,
+        gold_program,
+    )
+    if len(possible_matches) == 1:
         return list(possible_matches[0]["gold_evidence"])
 
     match_ids = [candidate["finqa_id"] for candidate in possible_matches]

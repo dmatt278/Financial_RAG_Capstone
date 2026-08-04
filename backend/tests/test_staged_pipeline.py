@@ -58,6 +58,7 @@ from app.rag.pipeline import (  # noqa: E402
     RETRIEVAL_SHORTLIST_SIZE,
     STAGE_2_ANALYSIS_NAME,
     STAGE_3_ANALYSIS_NAME,
+    _get_docfinqa_evidence_alignment,
     full_rag_parameter_sweep,
     full_rag_shortlist_sweep,
     full_rag_with_math_agent,
@@ -72,6 +73,8 @@ def _example():
         "question": "What is the value?",
         "gold_answer": "10",
         "document_id": "document-1",
+        "document_text": "full document text",
+        "program": "answer = 10",
     }
 
 
@@ -116,6 +119,34 @@ def _sweep_output(retrieval_configs, max_top_k=10):
 
 
 class StagedPipelineTests(unittest.TestCase):
+    @patch("app.rag.pipeline.align_docfinqa_evidence", return_value=[])
+    @patch("app.rag.pipeline.get_all_chunks", return_value=_chunks())
+    @patch(
+        "app.rag.pipeline.get_finqa_gold_evidence",
+        return_value=["evidence"],
+    )
+    def test_evidence_alignment_forwards_docfinqa_provenance(
+        self,
+        get_gold_evidence,
+        _get_chunks,
+        _align_evidence,
+    ):
+        example = _example()
+
+        _get_docfinqa_evidence_alignment(
+            example,
+            split="dev",
+            where={"document_id": {"$eq": "document-1"}},
+        )
+
+        get_gold_evidence.assert_called_once_with(
+            split="dev",
+            question=example["question"],
+            gold_answer=example["gold_answer"],
+            gold_program=example["program"],
+            document_text=example["document_text"],
+        )
+
     @patch("app.rag.pipeline.evaluate_retrieval")
     @patch("app.rag.pipeline.align_docfinqa_evidence", return_value=[])
     @patch("app.rag.pipeline.get_finqa_gold_evidence", return_value=["evidence"])
@@ -197,6 +228,14 @@ class StagedPipelineTests(unittest.TestCase):
         self.assertEqual(
             summary["shortlist_save_reason"],
             "result_logging_disabled",
+        )
+        example = _example()
+        _gold_evidence.assert_called_once_with(
+            split="train",
+            question=example["question"],
+            gold_answer=example["gold_answer"],
+            gold_program=example["program"],
+            document_text=example["document_text"],
         )
 
     @patch("app.rag.pipeline.complete_experiment_run")

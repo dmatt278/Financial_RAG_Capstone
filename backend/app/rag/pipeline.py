@@ -287,6 +287,8 @@ def _get_docfinqa_evidence_alignment(example, split, where):
         split=split,
         question=example["question"],
         gold_answer=example["gold_answer"],
+        gold_program=example.get("program"),
+        document_text=example.get("document_text"),
     )
     all_question_chunks = get_all_chunks(where=where)
     return align_docfinqa_evidence(
@@ -1437,6 +1439,8 @@ def top_chunks(
                 split=split,
                 question=example["question"],
                 gold_answer=example["gold_answer"],
+                gold_program=example.get("program"),
+                document_text=example.get("document_text"),
             )
 
         for filter_number, (
