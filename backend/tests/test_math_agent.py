@@ -14,6 +14,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 
 from app.rag.math_agent import (  # noqa: E402
+    MATH_PROGRAM_PROMPT_VERSION,
     execute_math_program,
     math_agent,
     validate_math_program,
@@ -33,15 +34,32 @@ def _program(steps, answer_unit="number", answer_scale="none"):
 
 class FakeCompletions:
     def __init__(self, content):
-        self.content = content
+        self.contents = content if isinstance(content, list) else [content]
+        self.requests = []
         self.last_request = None
 
     def create(self, **kwargs):
         self.last_request = kwargs
+        self.requests.append(kwargs)
+        response_data = self.contents[
+            min(len(self.requests) - 1, len(self.contents) - 1)
+        ]
+        if isinstance(response_data, dict):
+            content = response_data.get("content")
+            refusal = response_data.get("refusal")
+            finish_reason = response_data.get("finish_reason", "stop")
+        else:
+            content = response_data
+            refusal = None
+            finish_reason = "stop"
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content=self.content)
+                    message=SimpleNamespace(
+                        content=content,
+                        refusal=refusal,
+                    ),
+                    finish_reason=finish_reason,
                 )
             ]
         )
@@ -80,6 +98,61 @@ class MathProgramExecutionTests(unittest.TestCase):
 
         self.assertEqual(result["answer"], "25%")
         self.assertAlmostEqual(result["raw_answer"], 25)
+
+    def test_preserves_displayed_percentage_literal(self):
+        result = execute_math_program(
+            _program(
+                [
+                    {
+                        "operation": "identity",
+                        "arguments": ["25%"],
+                        "source_ids": [1],
+                    }
+                ],
+                answer_unit="percent",
+            )
+        )
+
+        self.assertEqual(result["answer"], "25%")
+        self.assertEqual(result["raw_answer"], 25)
+
+    def test_subtracts_displayed_percentage_literals(self):
+        result = execute_math_program(
+            _program(
+                [
+                    {
+                        "operation": "subtract",
+                        "arguments": ["25%", "20%"],
+                        "source_ids": [1],
+                    }
+                ],
+                answer_unit="percent",
+            )
+        )
+
+        self.assertEqual(result["answer"], "5%")
+        self.assertEqual(result["raw_answer"], 5)
+
+    def test_applies_percentage_literal_as_a_multiplier_after_conversion(self):
+        result = execute_math_program(
+            _program(
+                [
+                    {
+                        "operation": "divide",
+                        "arguments": ["25%", "const_100"],
+                        "source_ids": [1],
+                    },
+                    {
+                        "operation": "multiply",
+                        "arguments": ["#0", "200"],
+                        "source_ids": [1],
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(result["answer"], "50")
+        self.assertEqual(result["raw_answer"], 50)
 
     def test_greater_returns_yes_or_no(self):
         yes_result = execute_math_program(
@@ -185,9 +258,7 @@ class MathAgentGenerationTests(unittest.TestCase):
 
     @patch(
         "app.rag.math_agent.limit_chunks_to_prompt_budget",
-        side_effect=lambda question, retrieved_chunks, model, prompt_builder: (
-            retrieved_chunks
-        ),
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
     )
     def test_llm_plan_is_executed_without_a_gold_program(self, _limit_chunks):
         predicted_program = _program(
@@ -226,6 +297,9 @@ class MathAgentGenerationTests(unittest.TestCase):
         self.assertTrue(result["program_parse_succeeded"])
         self.assertTrue(result["execution_succeeded"])
         self.assertEqual(result["operand_grounding_rate"], 1.0)
+        self.assertEqual(result["prompt_version"], MATH_PROGRAM_PROMPT_VERSION)
+        self.assertEqual(result["program_generation_attempts"], 1)
+        self.assertFalse(result["repair_attempted"])
 
         request = client.completions.last_request
         prompt_text = "\n".join(
@@ -235,26 +309,99 @@ class MathAgentGenerationTests(unittest.TestCase):
         self.assertIn("percentage increase in revenue", prompt_text)
         self.assertIn("$125 million", prompt_text)
         self.assertNotIn("subtract(125, 100)", prompt_text)
+        self.assertIn("25% is executed as 25", prompt_text)
+        self.assertIn("first divide it by const_100", prompt_text)
         self.assertNotIn("program", inspect.signature(math_agent).parameters)
         self.assertEqual(request["temperature"], 0)
+        self.assertEqual(request["max_tokens"], 1024)
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        json_schema = request["response_format"]["json_schema"]
+        self.assertTrue(json_schema["strict"])
+        self.assertFalse(json_schema["schema"]["additionalProperties"])
+        self.assertFalse(
+            json_schema["schema"]["properties"]["steps"]["items"][
+                "additionalProperties"
+            ]
+        )
+        self.assertEqual(len(client.completions.requests), 1)
 
     @patch(
         "app.rag.math_agent.limit_chunks_to_prompt_budget",
-        side_effect=lambda question, retrieved_chunks, model, prompt_builder: (
-            retrieved_chunks
-        ),
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
     )
     def test_invalid_model_json_becomes_a_logged_failure(self, _limit_chunks):
+        client = FakeClient("not valid json")
         result = math_agent(
             question="What was the increase?",
             chunks=self.chunks,
-            client=FakeClient("not valid json"),
+            client=client,
         )
 
         self.assertEqual(result["status"], "generation_error")
         self.assertFalse(result["program_parse_succeeded"])
         self.assertFalse(result["execution_succeeded"])
         self.assertIn("JSON object", result["error"])
+        self.assertEqual(result["program_generation_attempts"], 2)
+        self.assertTrue(result["repair_attempted"])
+        self.assertEqual(len(client.completions.requests), 2)
+
+    @patch(
+        "app.rag.math_agent.limit_chunks_to_prompt_budget",
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
+    )
+    def test_invalid_program_is_repaired_once(self, _limit_chunks):
+        repaired_program = _program(
+            [
+                {
+                    "operation": "identity",
+                    "arguments": ["125"],
+                    "source_ids": [1],
+                }
+            ]
+        )
+        client = FakeClient(
+            ["not valid json", json.dumps(repaired_program)]
+        )
+
+        result = math_agent(
+            question="What was the revenue in 2023?",
+            chunks=self.chunks,
+            client=client,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["answer"], "125")
+        self.assertEqual(result["program_generation_attempts"], 2)
+        self.assertTrue(result["repair_attempted"])
+        self.assertEqual(len(result["raw_model_outputs"]), 2)
+        self.assertIn(
+            "previous mathematical program was rejected",
+            client.completions.last_request["messages"][-1]["content"],
+        )
+
+    @patch(
+        "app.rag.math_agent.limit_chunks_to_prompt_budget",
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
+    )
+    def test_model_refusal_is_not_retried(self, _limit_chunks):
+        client = FakeClient(
+            {
+                "content": None,
+                "refusal": "I cannot complete this request.",
+            }
+        )
+
+        result = math_agent(
+            question="What was the increase?",
+            chunks=self.chunks,
+            client=client,
+        )
+
+        self.assertEqual(result["status"], "generation_error")
+        self.assertIn("refused", result["error"])
+        self.assertEqual(result["program_generation_attempts"], 1)
+        self.assertFalse(result["repair_attempted"])
+        self.assertEqual(len(client.completions.requests), 1)
 
     def test_no_chunks_does_not_call_the_model(self):
         result = math_agent(
@@ -286,9 +433,7 @@ class MathAgentGenerationTests(unittest.TestCase):
 
     @patch(
         "app.rag.math_agent.limit_chunks_to_prompt_budget",
-        side_effect=lambda question, retrieved_chunks, model, prompt_builder: (
-            retrieved_chunks
-        ),
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
     )
     @patch("app.rag.math_agent.get_openai_client")
     def test_uses_shared_openai_client_when_client_is_not_supplied(
@@ -319,9 +464,7 @@ class MathAgentGenerationTests(unittest.TestCase):
 
     @patch(
         "app.rag.math_agent.limit_chunks_to_prompt_budget",
-        side_effect=lambda question, retrieved_chunks, model, prompt_builder: (
-            retrieved_chunks
-        ),
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
     )
     def test_ungrounded_operand_is_not_executed(self, _limit_chunks):
         predicted_program = _program(
@@ -346,9 +489,7 @@ class MathAgentGenerationTests(unittest.TestCase):
 
     @patch(
         "app.rag.math_agent.limit_chunks_to_prompt_budget",
-        side_effect=lambda question, retrieved_chunks, model, prompt_builder: (
-            retrieved_chunks
-        ),
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
     )
     def test_question_operand_can_use_source_zero(self, _limit_chunks):
         predicted_program = _program(
@@ -369,6 +510,39 @@ class MathAgentGenerationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["answer"], "5")
+        self.assertEqual(result["operand_grounding_rate"], 1.0)
+
+    @patch(
+        "app.rag.math_agent.limit_chunks_to_prompt_budget",
+        side_effect=lambda question, retrieved_chunks, **_kwargs: retrieved_chunks,
+    )
+    def test_percentage_lookup_stays_in_displayed_units(self, _limit_chunks):
+        chunks = [
+            {
+                "id": "chunk-percent",
+                "text": "The operating margin was 25% in 2023.",
+                "metadata": {},
+            }
+        ]
+        predicted_program = _program(
+            [
+                {
+                    "operation": "identity",
+                    "arguments": ["25%"],
+                    "source_ids": [1],
+                }
+            ],
+            answer_unit="percent",
+        )
+
+        result = math_agent(
+            question="What was the operating margin in 2023?",
+            chunks=chunks,
+            client=FakeClient(json.dumps(predicted_program)),
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["answer"], "25%")
         self.assertEqual(result["operand_grounding_rate"], 1.0)
 
 

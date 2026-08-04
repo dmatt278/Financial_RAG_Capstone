@@ -6,15 +6,20 @@ from typing import Any
 
 from app.rag.generator import (
     DEFAULT_OPENAI_MODEL,
-    MAX_GENERATION_TOKENS,
+    GPT4_CONTEXT_WINDOW_TOKENS,
     format_context,
     get_openai_client,
     limit_chunks_to_prompt_budget,
 )
 
 
-MATH_PROGRAM_PROMPT_VERSION = "docfinqa_math_program_v1"
+MATH_PROGRAM_PROMPT_VERSION = "docfinqa_math_program_v2"
 MAX_PROGRAM_STEPS = 12
+MATH_PROGRAM_MAX_TOKENS = 1024
+MATH_PROGRAM_MAX_PROMPT_TOKENS = (
+    GPT4_CONTEXT_WINDOW_TOKENS - MATH_PROGRAM_MAX_TOKENS
+)
+MATH_PROGRAM_MAX_ATTEMPTS = 2
 MAX_ABS_EXPONENT = 20
 SUPPORTED_OPERATIONS = {
     "identity",
@@ -54,6 +59,70 @@ ANSWER_SCALE_LABELS = {
     "billion": " billion",
     "trillion": " trillion",
 }
+MATH_PROGRAM_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "docfinqa_math_program",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["ok", "insufficient_context"],
+                },
+                "reason": {"type": "string"},
+                "steps": {
+                    "type": "array",
+                    "maxItems": MAX_PROGRAM_STEPS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": sorted(SUPPORTED_OPERATIONS),
+                            },
+                            "arguments": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {"type": "string"},
+                            },
+                            "source_ids": {
+                                "type": "array",
+                                "items": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                },
+                            },
+                        },
+                        "required": [
+                            "operation",
+                            "arguments",
+                            "source_ids",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+                "answer_unit": {
+                    "type": "string",
+                    "enum": sorted(ANSWER_UNITS),
+                },
+                "answer_scale": {
+                    "type": "string",
+                    "enum": sorted(ANSWER_SCALES),
+                },
+            },
+            "required": [
+                "status",
+                "reason",
+                "steps",
+                "answer_unit",
+                "answer_scale",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
 STEP_REFERENCE_PATTERN = re.compile(r"^#(\d+)$")
 SOURCE_NUMBER_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])"
@@ -61,6 +130,26 @@ SOURCE_NUMBER_PATTERN = re.compile(
     r"[-+]?\$?\s*\d[\d,]*(?:\.\d+)?%?"
     r"(?:\s*\))?"
 )
+
+
+class MathProgramGenerationError(ValueError):
+    """Retains the final model output when program generation cannot recover."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_model_outputs: list[str],
+        attempts: int,
+    ):
+        super().__init__(message)
+        self.raw_model_outputs = list(raw_model_outputs)
+        self.raw_model_output = (
+            self.raw_model_outputs[-1]
+            if self.raw_model_outputs
+            else ""
+        )
+        self.attempts = attempts
 
 
 def build_math_program_prompt(
@@ -107,7 +196,8 @@ def build_math_program_prompt(
                 "The allowed answer_scale values are none, thousand, million, "
                 "billion, and trillion. "
                 "Allowed operations: identity, add, subtract, multiply, "
-                "divide, exp, greater, less, equal, sum, average, max, and min. "
+                "divide, exp, greater, less, equal, sum, average, max, min, "
+                "table_sum, table_average, table_max, and table_min. "
                 "Use identity for a direct numeric lookup. Binary arithmetic and "
                 "comparisons take exactly two arguments. Aggregate operations take "
                 "one or more arguments. A reference such as #0 means the result of "
@@ -121,12 +211,16 @@ def build_math_program_prompt(
                 "List the supporting source number for every non-constant literal. "
                 "Use source id 0 for a value stated in the question and the displayed "
                 "1-based source number for a value from retrieved context. "
-                "For a percentage answer, make the final step return the displayed "
-                "percentage value (25 for 25 percent), normally by multiplying a "
-                "ratio by const_100, and set answer_unit to percent. Set answer_scale "
-                "from the unit requested by the question; otherwise use none. Python "
-                "will only execute and format the plan. If any required value is "
-                "absent or ambiguous, set "
+                "Percentage literals use displayed percentage-point values: 25% is "
+                "executed as 25. For a percentage answer, make the final step return "
+                "that displayed value, normally by multiplying a ratio by const_100, "
+                "and set answer_unit to percent. When using a percentage literal as a "
+                "multiplier, first divide it by const_100. For example, a direct "
+                "lookup of 12.5% uses identity with argument 12.5%, while applying "
+                "12.5% to 200 first divides 12.5% by const_100 and then multiplies "
+                "that result by 200. Set answer_scale from the unit requested by the "
+                "question; otherwise use none. Python will only execute and format "
+                "the plan. If any required value is absent or ambiguous, set "
                 "status to insufficient_context and return an empty steps list. "
                 "Never use outside knowledge, the gold answer, or a precomputed "
                 "result."
@@ -155,8 +249,7 @@ def _parse_numeric_literal(value: Any) -> float:
         if negative_parentheses:
             text = text[1:-1].strip()
 
-        is_percent = text.endswith("%")
-        if is_percent:
+        if text.endswith("%"):
             text = text[:-1].strip()
 
         text = text.replace("$", "").replace(",", "").replace(" ", "")
@@ -167,8 +260,6 @@ def _parse_numeric_literal(value: Any) -> float:
 
         if negative_parentheses:
             number = -number
-        if is_percent:
-            number /= 100
     else:
         raise ValueError(
             f"Numeric operands must be strings or numbers, not {type(value).__name__}."
@@ -526,6 +617,7 @@ def generate_math_program(
         question=question,
         retrieved_chunks=chunks,
         model=model,
+        max_prompt_tokens=MATH_PROGRAM_MAX_PROMPT_TOKENS,
         prompt_builder=build_math_program_prompt,
     )
     if not limited_chunks:
@@ -538,21 +630,86 @@ def generate_math_program(
             )
         client = get_openai_client()
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=build_math_program_prompt(question, limited_chunks),
-        temperature=0,
-        max_tokens=MAX_GENERATION_TOKENS,
-    )
-    raw_model_output = response.choices[0].message.content or ""
-    program = parse_math_program(
-        raw_model_output,
-        source_count=len(limited_chunks),
-    )
+    base_messages = build_math_program_prompt(question, limited_chunks)
+    messages = base_messages
+    raw_model_outputs = []
+    program = None
+
+    for attempt in range(1, MATH_PROGRAM_MAX_ATTEMPTS + 1):
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0,
+            max_tokens=MATH_PROGRAM_MAX_TOKENS,
+            response_format=MATH_PROGRAM_RESPONSE_FORMAT,
+        )
+        if not response.choices:
+            raw_model_output = ""
+            validation_error = ValueError(
+                "The model response did not contain a completion choice."
+            )
+        else:
+            choice = response.choices[0]
+            message = choice.message
+            refusal = getattr(message, "refusal", None)
+            if refusal:
+                raise MathProgramGenerationError(
+                    f"The model refused to create a mathematical program: {refusal}",
+                    raw_model_outputs=raw_model_outputs,
+                    attempts=attempt,
+                )
+
+            raw_model_output = message.content or ""
+            raw_model_outputs.append(raw_model_output)
+            try:
+                if getattr(choice, "finish_reason", None) == "length":
+                    raise ValueError(
+                        "The mathematical program was truncated by the output-token "
+                        "limit."
+                    )
+                program = parse_math_program(
+                    raw_model_output,
+                    source_count=len(limited_chunks),
+                )
+                break
+            except ValueError as exc:
+                validation_error = exc
+
+        if attempt == MATH_PROGRAM_MAX_ATTEMPTS:
+            raise MathProgramGenerationError(
+                "The mathematical program was invalid after "
+                f"{attempt} attempts: {validation_error}",
+                raw_model_outputs=raw_model_outputs,
+                attempts=attempt,
+            )
+
+        messages = list(base_messages)
+        if raw_model_output:
+            messages.append(
+                {"role": "assistant", "content": raw_model_output}
+            )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your previous mathematical program was rejected. "
+                    f"Validation error: {validation_error} Return one corrected "
+                    "JSON object matching the required schema and every original "
+                    "grounding, source, and reference rule. Do not explain the "
+                    "correction and do not calculate the final answer."
+                ),
+            }
+        )
+
+    if program is None:
+        raise RuntimeError("The mathematical program generator ended unexpectedly.")
 
     return {
         "program": program,
-        "raw_model_output": raw_model_output,
+        "raw_model_output": raw_model_outputs[-1],
+        "raw_model_outputs": raw_model_outputs,
+        "program_generation_attempts": attempt,
+        "repair_attempted": attempt > 1,
         "model": model,
         "context_chunks": limited_chunks,
         "context_chunk_ids": [
@@ -651,8 +808,11 @@ def math_agent(
         "raw_answer": None,
         "program": None,
         "raw_model_output": None,
+        "raw_model_outputs": [],
         "model": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         "prompt_version": MATH_PROGRAM_PROMPT_VERSION,
+        "program_generation_attempts": 0,
+        "repair_attempted": False,
         "program_parse_succeeded": False,
         "execution_succeeded": False,
         "error": None,
@@ -689,7 +849,12 @@ def math_agent(
             {
                 "program": generation["program"],
                 "raw_model_output": generation["raw_model_output"],
+                "raw_model_outputs": generation["raw_model_outputs"],
                 "model": generation["model"],
+                "program_generation_attempts": generation[
+                    "program_generation_attempts"
+                ],
+                "repair_attempted": generation["repair_attempted"],
                 "program_parse_succeeded": True,
                 "generation_context_chunk_ids": generation[
                     "context_chunk_ids"
@@ -709,6 +874,15 @@ def math_agent(
             APIError = ()
         if isinstance(exc, APIError):
             raise
+        if isinstance(exc, MathProgramGenerationError):
+            result.update(
+                {
+                    "raw_model_output": exc.raw_model_output,
+                    "raw_model_outputs": exc.raw_model_outputs,
+                    "program_generation_attempts": exc.attempts,
+                    "repair_attempted": exc.attempts > 1,
+                }
+            )
         result["error"] = str(exc)
         return result
 

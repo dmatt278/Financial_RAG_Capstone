@@ -65,6 +65,7 @@ from app.rag.pipeline import (  # noqa: E402
     get_baseline_results,
     top_chunks,
 )
+from app.rag.math_agent import MATH_PROGRAM_PROMPT_VERSION  # noqa: E402
 
 
 def _example():
@@ -995,10 +996,28 @@ class StagedPipelineTests(unittest.TestCase):
             start_run.call_args.kwargs["parameters"]["comparison_methods"],
             ["direct_llm", "math_agent"],
         )
+        self.assertEqual(
+            start_run.call_args.kwargs["parameters"]["math_prompt_version"],
+            MATH_PROGRAM_PROMPT_VERSION,
+        )
+        self.assertEqual(
+            summary["math_prompt_version"],
+            MATH_PROGRAM_PROMPT_VERSION,
+        )
         save_statistics.assert_called_once()
         self.assertIn(
             "math_agent_vs_direct_llm__",
             save_statistics.call_args.kwargs["analysis_name"],
+        )
+        self.assertIn(
+            MATH_PROGRAM_PROMPT_VERSION,
+            save_statistics.call_args.kwargs["analysis_name"],
+        )
+        self.assertEqual(
+            save_statistics.call_args.kwargs["analysis"][
+                "math_prompt_version"
+            ],
+            MATH_PROGRAM_PROMPT_VERSION,
         )
         update_progress.assert_called_once_with(
             run_id="math-run-id",

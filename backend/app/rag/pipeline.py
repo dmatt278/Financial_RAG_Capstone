@@ -24,7 +24,12 @@ from app.rag.generator import (
     generate_no_context_answer,
     limit_chunks_to_prompt_budget,
 )
-from app.rag.math_agent import build_math_program_prompt, math_agent
+from app.rag.math_agent import (
+    MATH_PROGRAM_MAX_PROMPT_TOKENS,
+    MATH_PROGRAM_PROMPT_VERSION,
+    build_math_program_prompt,
+    math_agent,
+)
 from app.rag.parameter_selection import (
     RETRIEVAL_SCORE_WEIGHTS,
     build_reranker_configs,
@@ -1835,6 +1840,7 @@ def full_rag_with_math_agent(
         "chunk_size": chunk_size,
         "comparison_methods": list(comparison_methods),
         "reranker_enabled": False,
+        "math_prompt_version": MATH_PROGRAM_PROMPT_VERSION,
     }
 
     results = []
@@ -2013,6 +2019,7 @@ def full_rag_with_math_agent(
                         question=example["question"],
                         retrieved_chunks=chunks,
                         model=model,
+                        max_prompt_tokens=MATH_PROGRAM_MAX_PROMPT_TOKENS,
                         prompt_builder=build_math_program_prompt,
                     )
                     shared_chunks = limit_chunks_to_prompt_budget(
@@ -2077,6 +2084,7 @@ def full_rag_with_math_agent(
                     "answer_source": "direct_llm_calculation",
                     "comparison_method": "direct_llm",
                     "model": model,
+                    "math_experiment_version": MATH_PROGRAM_PROMPT_VERSION,
                     **direct_context_metrics,
                     "shared_context_chunk_ids": task[
                         "shared_context_chunk_ids"
@@ -2115,10 +2123,23 @@ def full_rag_with_math_agent(
                     "shared_context_chunk_ids"
                 ],
                 "math_prompt_version": agent_result["prompt_version"],
+                "math_experiment_version": MATH_PROGRAM_PROMPT_VERSION,
                 "math_agent_status": agent_result["status"],
                 "math_program": agent_result["program"],
                 "raw_math_answer": agent_result["raw_answer"],
                 "raw_program_response": agent_result["raw_model_output"],
+                "raw_program_responses": agent_result.get(
+                    "raw_model_outputs",
+                    [],
+                ),
+                "program_generation_attempts": agent_result.get(
+                    "program_generation_attempts",
+                    0,
+                ),
+                "program_repair_attempted": agent_result.get(
+                    "repair_attempted",
+                    False,
+                ),
                 "program_parse_succeeded": agent_result[
                     "program_parse_succeeded"
                 ],
@@ -2260,6 +2281,7 @@ def full_rag_with_math_agent(
             {
                 "config_id": config_id,
                 "config": config_outcomes["config"],
+                "math_prompt_version": MATH_PROGRAM_PROMPT_VERSION,
                 "statistics_used_to_select_rag_parameters": False,
                 "comparison_note": (
                     "Both methods received the same effective chunks. This "
@@ -2332,7 +2354,9 @@ def full_rag_with_math_agent(
                 source_experiment=MATH_AGENT_EXPERIMENT,
                 source_split=split,
                 analysis_name=(
-                    f"{MATH_AGENT_ANALYSIS_NAME}__{analysis['config_id']}"
+                    f"{MATH_AGENT_ANALYSIS_NAME}__"
+                    f"{MATH_PROGRAM_PROMPT_VERSION}__"
+                    f"{analysis['config_id']}"
                 ),
                 analysis=analysis,
             )
@@ -2361,6 +2385,7 @@ def full_rag_with_math_agent(
         "dataset": "docfinqa",
         "split": split,
         "model": model,
+        "math_prompt_version": MATH_PROGRAM_PROMPT_VERSION,
         "start_index": start_index,
         "requested_limit": limit,
         "sample_size": sample_size,
